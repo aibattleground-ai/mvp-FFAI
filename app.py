@@ -1,952 +1,928 @@
-import math
-import time
-import urllib.request
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+# app.py
+# FormFoundry AI — A4 Marker (PnP/Homography) Calibrated Measurement MVP
+# Drop-in replacement for your existing Streamlit app.py
 
-import cv2
+from __future__ import annotations
+
+import io
+import json
+import math
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import streamlit as st
-import torch
-from PIL import Image, ImageOps
-from ultralytics import YOLO
-import mediapipe as mp
 
-import timm
-from torchvision import transforms
+# --- Optional / heavy deps (guarded) ---
+try:
+    import cv2
+except Exception as e:
+    cv2 = None
 
-# MediaPipe Tasks
-from mediapipe.tasks import python as mp_tasks
-from mediapipe.tasks.python import vision
+try:
+    import mediapipe as mp
+except Exception:
+    mp = None
+
+try:
+    from ultralytics import YOLO
+except Exception:
+    YOLO = None
 
 
-# =========================================================
+# =========================
 # Config
-# =========================================================
-CIRC_RATIO_CHEST = 2.25   # 2.35 -> 과대/과소 흔들림 커서 완화
-CIRC_RATIO_WAIST = 2.15
-CIRC_RATIO_HIP = 2.20
-
-# "공제(deduction)"는 body_mask를 안쪽으로 복원할 때 쓰는 값(전체 너비 기준)
-GARMENT_DB = {
-    "Short Sleeve": {"base_width_deduct_cm": 0.6, "desc": "Light / Thin Top"},
-    "Long Sleeve":  {"base_width_deduct_cm": 1.0, "desc": "Standard Long Sleeve"},
-    "Hoodie/Sweat": {"base_width_deduct_cm": 2.2, "desc": "Heavy Knit / Fleece"},
-    "Outer/Jacket": {"base_width_deduct_cm": 2.8, "desc": "Outerwear / Thick"},
-}
-
-# Fit의 air-gap 공제를 MVP 수준으로 낮춤(기존 1.5~4.0은 반팔에서 과도)
-FIT_DB = {
-    "Tight":   {"ease_width_deduct_cm": 0.2, "msg": "Skin Fit (Low air-gap)"},
-    "Regular": {"ease_width_deduct_cm": 0.7, "msg": "Standard Drape"},
-    "Loose":   {"ease_width_deduct_cm": 1.6, "msg": "Air-gap / Gravity Drape"},
-}
-
-POSE_EDGES = [
-    (0, 1), (1, 2), (2, 3), (0, 4), (4, 5), (5, 6),
-    (3, 7), (6, 8), (9, 10),
-    (11, 12), (11, 23), (12, 24), (23, 24),
-    (11, 13), (13, 15), (15, 17), (15, 19), (15, 21),
-    (12, 14), (14, 16), (16, 18), (16, 20), (16, 22),
-    (23, 25), (25, 27), (27, 29), (29, 31),
-    (24, 26), (26, 28), (28, 30), (30, 32),
-]
-
-MODELS_DIR = Path(__file__).parent / "models"
-POSE_TASK_PATH = MODELS_DIR / "pose_landmarker_heavy.task"
-POSE_TASK_URL = (
-    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
-    "pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task"
+# =========================
+st.set_page_config(
+    page_title="FormFoundry AI — A4 Calibrated Measurement MVP",
+    layout="wide",
 )
 
+A4_W_MM = 210.0
+A4_H_MM = 297.0
 
-# =========================================================
-# Data container
-# =========================================================
+# Marker sheet design assumptions (matches provided PDF preview well)
+MARKER_DICT_NAME = "DICT_4X4_50"
+MARKER_IDS_REQUIRED = {0, 1, 2, 3}
+MARKER_SIDE_MM = 45.0     # approx from PDF (works well)
+MARGIN_MM = 10.0          # approx from PDF (works well)
+
+# Default fixed ratios (MVP)
+DEFAULT_RATIOS = {
+    "chest": 2.25,
+    "waist": 2.15,
+    "hip": 2.20,
+}
+
+GARMENT_PRIORS_CM_PER_SIDE = {
+    # "per side" thickness+ease proxy (start point)
+    "sleeveless": (0.2, 0.5),
+    "short_sleeve": (0.2, 0.6),
+    "long_sleeve": (0.3, 0.8),
+    "hoodie": (0.6, 1.5),
+    "coat": (1.2, 2.5),
+    "puffer": (2.0, 4.0),
+}
+
+MATERIAL_ADJ_CM = {
+    "cotton blend": -0.1,
+    "thin cotton": -0.2,
+    "knit": +0.3,
+    "wool": +0.4,
+    "leather": +0.6,
+    "down": +0.8,
+    "synthetic": +0.1,
+    "unknown": 0.0,
+}
+
+
+# =========================
+# Data classes
+# =========================
 @dataclass
-class Lm:
-    x: float
-    y: float
-    z: float = 0.0
-    visibility: float = 1.0
+class PoseLandmarks:
+    # Pixel coords in the WORKING plane (rectified A4 px if available, else original image px)
+    xy: Dict[int, Tuple[float, float]]
+    # mediapipe z (relative) for rotation hint if available
+    z: Dict[int, float]
 
 
-# =========================================================
-# Cached loaders
-# =========================================================
-def _ensure_pose_task() -> None:
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    if POSE_TASK_PATH.exists():
-        return
-    # 다운로드(웹 배포/Streamlit Cloud에서도 동작)
-    urllib.request.urlretrieve(POSE_TASK_URL, str(POSE_TASK_PATH))
+@dataclass
+class A4Calib:
+    ok: bool
+    H_img2mm: Optional[np.ndarray] = None
+    H_img2px: Optional[np.ndarray] = None
+    px_per_mm: Optional[float] = None
+    a4_size_px: Optional[Tuple[int, int]] = None
+    debug: Optional[dict] = None
 
 
-@st.cache_resource(show_spinner=False)
-def load_pose_landmarker() -> vision.PoseLandmarker:
-    _ensure_pose_task()
-    base = mp_tasks.BaseOptions(model_asset_path=str(POSE_TASK_PATH))
-    opts = vision.PoseLandmarkerOptions(
-        base_options=base,
-        running_mode=vision.RunningMode.IMAGE,
-        num_poses=1,
-        output_segmentation_masks=False,
+@dataclass
+class MeasurementResult:
+    px_per_cm: float
+    rotation_deg: float
+    garment_class: str
+    material: str
+    offset_per_side_cm: float
+    width_deduct_cm: float
+
+    shoulder_width_cm: Optional[float]
+    chest_circ_cm: Optional[float]
+    waist_circ_cm: Optional[float]
+    hip_circ_cm: Optional[float]
+    arm_len_cm: Optional[float]
+    leg_len_cm: Optional[float]
+
+    debug: dict
+
+
+# =========================
+# Utility
+# =========================
+def _require_cv2():
+    if cv2 is None:
+        st.error("OpenCV(cv2) import failed. Please ensure opencv-python is installed.")
+        st.stop()
+    if not hasattr(cv2, "aruco"):
+        st.error(
+            "cv2.aruco is not available. Install opencv-contrib-python (not opencv-python only)."
+        )
+        st.stop()
+
+
+def _to_bgr(img_rgb: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+
+
+def _to_rgb(img_bgr: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+
+def _read_image(file) -> np.ndarray:
+    data = file.read()
+    arr = np.frombuffer(data, dtype=np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise ValueError("Failed to decode image.")
+    return bgr
+
+
+def _apply_homography_pts(pts_xy: np.ndarray, H: np.ndarray) -> np.ndarray:
+    # pts_xy: (N,2)
+    pts = pts_xy.reshape(-1, 1, 2).astype(np.float32)
+    out = cv2.perspectiveTransform(pts, H)
+    return out.reshape(-1, 2)
+
+
+def _safe_int(v: float, lo: int, hi: int) -> int:
+    return int(max(lo, min(hi, round(v))))
+
+
+# =========================
+# A4 marker detection & rectification
+# =========================
+def _aruco_dict_by_name(name: str):
+    aruco = cv2.aruco
+    if not hasattr(aruco, name):
+        raise ValueError(f"Unknown aruco dict name: {name}")
+    return aruco.getPredefinedDictionary(getattr(aruco, name))
+
+
+def _marker_centers_mm() -> Dict[int, Tuple[float, float]]:
+    # Center positions for 4 corner markers on the A4 sheet plane (mm)
+    # origin: top-left of paper
+    cx = MARGIN_MM + MARKER_SIDE_MM / 2.0
+    cy = MARGIN_MM + MARKER_SIDE_MM / 2.0
+    right_cx = A4_W_MM - cx
+    bot_cy = A4_H_MM - cy
+    return {
+        0: (cx, cy),          # top-left
+        1: (right_cx, cy),    # top-right
+        2: (right_cx, bot_cy),# bottom-right
+        3: (cx, bot_cy),      # bottom-left
+    }
+
+
+def _marker_object_corners_mm(marker_id: int) -> np.ndarray:
+    # returns 4x2 corners in mm in order: tl,tr,br,bl
+    centers = _marker_centers_mm()
+    if marker_id not in centers:
+        raise ValueError("Unexpected marker id")
+    cx, cy = centers[marker_id]
+    h = MARKER_SIDE_MM / 2.0
+    return np.array(
+        [
+            [cx - h, cy - h],
+            [cx + h, cy - h],
+            [cx + h, cy + h],
+            [cx - h, cy + h],
+        ],
+        dtype=np.float32,
     )
-    return vision.PoseLandmarker.create_from_options(opts)
 
 
-@st.cache_resource(show_spinner=False)
-def load_yolo() -> YOLO:
+def detect_a4_calibration(
+    img_bgr: np.ndarray,
+    px_per_mm: float = 6.0,
+    dict_name: str = MARKER_DICT_NAME,
+) -> A4Calib:
+    _require_cv2()
+
+    aruco = cv2.aruco
+    d = _aruco_dict_by_name(dict_name)
+    params = aruco.DetectorParameters()
+    detector = aruco.ArucoDetector(d, params)
+
+    corners, ids, _rej = detector.detectMarkers(img_bgr)
+    if ids is None or len(ids) == 0:
+        return A4Calib(ok=False, debug={"reason": "no_markers"})
+
+    ids_list = [int(i) for i in ids.flatten().tolist()]
+    found = set(ids_list)
+    missing = list(MARKER_IDS_REQUIRED - found)
+    if missing:
+        return A4Calib(ok=False, debug={"reason": "missing_markers", "missing": missing, "found": ids_list})
+
+    # Build correspondence using ALL marker corners (16 points) for robust homography.
+    img_pts = []
+    obj_pts = []
+    for c, mid in zip(corners, ids.flatten()):
+        mid = int(mid)
+        if mid not in MARKER_IDS_REQUIRED:
+            continue
+        c2 = c.reshape(-1, 2).astype(np.float32)  # tl,tr,br,bl in image
+        obj = _marker_object_corners_mm(mid)      # tl,tr,br,bl in mm
+        img_pts.append(c2)
+        obj_pts.append(obj)
+
+    img_pts = np.vstack(img_pts).astype(np.float32)
+    obj_pts = np.vstack(obj_pts).astype(np.float32)
+
+    H_img2mm, inliers = cv2.findHomography(img_pts, obj_pts, method=cv2.RANSAC, ransacReprojThreshold=4.0)
+    if H_img2mm is None:
+        return A4Calib(ok=False, debug={"reason": "homography_failed"})
+
+    S = np.array([[px_per_mm, 0, 0], [0, px_per_mm, 0], [0, 0, 1]], dtype=np.float64)
+    H_img2px = S @ H_img2mm
+
+    a4_w_px = int(round(A4_W_MM * px_per_mm))
+    a4_h_px = int(round(A4_H_MM * px_per_mm))
+
+    return A4Calib(
+        ok=True,
+        H_img2mm=H_img2mm,
+        H_img2px=H_img2px,
+        px_per_mm=px_per_mm,
+        a4_size_px=(a4_w_px, a4_h_px),
+        debug={
+            "markers_found": ids_list,
+            "px_per_mm": px_per_mm,
+            "a4_size_px": (a4_w_px, a4_h_px),
+        },
+    )
+
+
+def warp_to_a4(img_bgr: np.ndarray, calib: A4Calib) -> np.ndarray:
+    assert calib.ok and calib.H_img2px is not None and calib.a4_size_px is not None
+    w_px, h_px = calib.a4_size_px[0], calib.a4_size_px[1]
+    warped = cv2.warpPerspective(img_bgr, calib.H_img2px, (w_px, h_px))
+    return warped
+
+
+def warp_mask_to_a4(mask01: np.ndarray, calib: A4Calib) -> np.ndarray:
+    # mask01 shape HxW uint8 {0,1}
+    assert calib.ok and calib.H_img2px is not None and calib.a4_size_px is not None
+    w_px, h_px = calib.a4_size_px[0], calib.a4_size_px[1]
+    warped = cv2.warpPerspective(mask01.astype(np.uint8) * 255, calib.H_img2px, (w_px, h_px), flags=cv2.INTER_NEAREST)
+    return (warped > 127).astype(np.uint8)
+
+
+# =========================
+# Pose
+# =========================
+@st.cache_resource
+def _get_pose_model():
+    if mp is None:
+        return None
+    Pose = mp.solutions.pose.Pose
+    return Pose(
+        static_image_mode=True,
+        model_complexity=1,
+        enable_segmentation=False,
+        min_detection_confidence=0.5,
+    )
+
+
+def infer_pose_landmarks(
+    img_bgr: np.ndarray,
+    calib: Optional[A4Calib],
+) -> Optional[PoseLandmarks]:
+    if mp is None:
+        st.warning("mediapipe is not installed; pose module disabled.")
+        return None
+
+    pose_model = _get_pose_model()
+    if pose_model is None:
+        return None
+
+    img_rgb = _to_rgb(img_bgr)
+    h, w = img_rgb.shape[:2]
+    res = pose_model.process(img_rgb)
+    if not res.pose_landmarks:
+        return None
+
+    xy = {}
+    z = {}
+    for idx, lm in enumerate(res.pose_landmarks.landmark):
+        x_px = lm.x * w
+        y_px = lm.y * h
+        z[idx] = float(lm.z)
+        xy[idx] = (float(x_px), float(y_px))
+
+    # If calibrated, map to rectified A4 pixel plane
+    if calib is not None and calib.ok and calib.H_img2px is not None:
+        pts = np.array(list(xy.values()), dtype=np.float32)
+        pts2 = _apply_homography_pts(pts, calib.H_img2px)
+        xy2 = {}
+        for i, k in enumerate(list(xy.keys())):
+            xy2[k] = (float(pts2[i, 0]), float(pts2[i, 1]))
+        xy = xy2
+
+    return PoseLandmarks(xy=xy, z=z)
+
+
+def estimate_rotation_deg(pose: PoseLandmarks) -> float:
+    # Shoulder depth-based yaw proxy
+    # MediaPipe: left_shoulder=11, right_shoulder=12
+    if 11 not in pose.xy or 12 not in pose.xy:
+        return 0.0
+    # use mediapipe z if available
+    zL = pose.z.get(11, 0.0)
+    zR = pose.z.get(12, 0.0)
+    xL, yL = pose.xy[11]
+    xR, yR = pose.xy[12]
+    shoulder_span = max(1e-6, abs(xR - xL))
+    dz = (zR - zL)
+    # normalized-ish; clamp to keep stable
+    rot = math.degrees(math.atan2(dz, shoulder_span / 1000.0))  # heuristic scaling
+    return float(max(-30.0, min(30.0, rot)))
+
+
+# =========================
+# Segmentation (person mask)
+# =========================
+@st.cache_resource
+def _get_yolo_seg_model():
+    if YOLO is None:
+        return None
     return YOLO("yolov8n-seg.pt")
 
 
-@st.cache_resource(show_spinner=False)
-def load_material_backbone(name: str = "swin_tiny_patch4_window7_224") -> torch.nn.Module:
-    # MVP 데모: "실행"이 핵심이므로 pretrained=True 유지
-    model = timm.create_model(name, pretrained=True, num_classes=0)
-    model.eval()
-    return model
-
-
-# =========================================================
-# Utils
-# =========================================================
-def pil_to_rgb(pil_img: Image.Image) -> np.ndarray:
-    pil_img = ImageOps.exif_transpose(pil_img)
-    return np.array(pil_img.convert("RGB"))
-
-
-def safe_int(v: float, lo: int, hi: int) -> int:
-    return max(lo, min(int(v), hi))
-
-
-def lm_xy(lm: List[Lm], idx: int, w: int, h: int) -> Tuple[int, int]:
-    return safe_int(lm[idx].x * w, 0, w - 1), safe_int(lm[idx].y * h, 0, h - 1)
-
-
-def draw_skeleton(img_bgr: np.ndarray, lm: List[Lm]) -> None:
-    h, w = img_bgr.shape[:2]
-    for a, b in POSE_EDGES:
-        ax, ay = lm_xy(lm, a, w, h)
-        bx, by = lm_xy(lm, b, w, h)
-        cv2.line(img_bgr, (ax, ay), (bx, by), (255, 255, 255), 2, cv2.LINE_AA)
-    for i in range(len(lm)):
-        x, y = lm_xy(lm, i, w, h)
-        cv2.circle(img_bgr, (x, y), 3, (0, 255, 255), -1, cv2.LINE_AA)
-
-
-def rotation_compensation(lm: List[Lm]) -> Tuple[float, float]:
-    lz, rz = lm[11].z, lm[12].z
-    z_diff = abs(lz - rz)
-    theta = min(z_diff * 2.0, 1.0)
-    deg = math.degrees(theta)
-    factor = 1.0 / max(math.cos(theta), 0.55)
-    return factor, deg
-
-
-def geodesic_height_px(lm: List[Lm], w: int, h: int) -> float:
-    def dist(i1: int, i2: int) -> float:
-        x1, y1 = lm[i1].x * w, lm[i1].y * h
-        x2, y2 = lm[i2].x * w, lm[i2].y * h
-        return math.hypot(x2 - x1, y2 - y1)
-
-    # head: nose->mid-shoulder (보정은 낮춤: 1.6 -> 1.25)
-    mid_sh_x = (lm[11].x + lm[12].x) / 2
-    mid_sh_y = (lm[11].y + lm[12].y) / 2
-    nose_x, nose_y = lm[0].x * w, lm[0].y * h
-    head = math.hypot(mid_sh_x * w - nose_x, mid_sh_y * h - nose_y) * 1.25
-
-    torso = (dist(11, 23) + dist(12, 24)) / 2
-    left_leg = dist(23, 25) + dist(25, 27)
-    right_leg = dist(24, 26) + dist(26, 28)
-    leg = (left_leg + right_leg) / 2
-    return head + torso + leg
-
-
-def vertical_span_height_px(lm: List[Lm], h: int) -> float:
-    # 상단: nose/eyes/ears 중 가장 위
-    top = min(lm[i].y for i in [0, 1, 2, 3, 4, 5, 6, 7, 8])
-    # 하단: heels/foot-index 중 가장 아래
-    bottom = max(lm[i].y for i in [29, 30, 31, 32, 27, 28])
-    span = max(0.0, (bottom - top) * h)
-    return span
-
-
-def estimate_px_per_cm(lm: List[Lm], w: int, h: int, height_cm: float) -> Tuple[float, Dict[str, float]]:
-    """
-    1) geodesic + vertical span을 섞어서 스케일 안정화
-    2) 어깨/키 비율 sanity calibration(약하게)로 과소/과대 스케일을 완화
-    """
-    px_geo = geodesic_height_px(lm, w, h)
-    px_span = vertical_span_height_px(lm, h)
-
-    # 둘 중 하나가 실패하면 다른 쪽 사용
-    px_h = 0.55 * px_span + 0.45 * px_geo if (px_span > 10 and px_geo > 10) else max(px_span, px_geo)
-    px_per_cm = px_h / max(height_cm, 1e-6)
-
-    # shoulder sanity (약한 보정)
-    sh_px = math.hypot((lm[11].x - lm[12].x) * w, (lm[11].y - lm[12].y) * h)
-    shoulder_cm_raw = sh_px / max(px_per_cm, 1e-6)
-    ratio = shoulder_cm_raw / max(height_cm, 1e-6)
-
-    # 남성 기준 대략 0.215~0.285 범위에 약하게 맞춤(데모용)
-    target_min = 0.215
-    target_max = 0.285
-    adj = 1.0
-    if ratio < target_min:
-        adj = ratio / target_min  # <1 => px_per_cm 줄여서(cm 증가)
-        px_per_cm *= max(adj, 0.82)  # 과보정 방지
-    elif ratio > target_max:
-        adj = ratio / target_max  # >1 => px_per_cm 늘려서(cm 감소)
-        px_per_cm *= min(adj, 1.18)
-
-    dbg = {
-        "px_geo": float(px_geo),
-        "px_span": float(px_span),
-        "px_h_used": float(px_h),
-        "px_per_cm": float(px_per_cm),
-        "shoulder_cm_raw": float(shoulder_cm_raw),
-        "shoulder_height_ratio": float(ratio),
-        "shoulder_sanity_adj": float(adj),
-    }
-    return float(px_per_cm), dbg
-
-
-def yolo_person_mask(rgb: np.ndarray, yolo: YOLO) -> Tuple[np.ndarray, float]:
-    h, w = rgb.shape[:2]
-    conf = 0.0
-    mask_bin = np.zeros((h, w), dtype=np.uint8)
-
-    res = yolo(rgb, verbose=False, classes=[0], conf=0.25)
-    if not res or res[0] is None:
-        return mask_bin, conf
-    r0 = res[0]
-    if r0.masks is None or r0.boxes is None or len(r0.boxes) == 0:
-        return mask_bin, conf
-
-    c = r0.boxes.conf.detach().cpu()
-    best = int(torch.argmax(c).item())
-    conf = float(c[best].item())
-
-    m = r0.masks.data[best].detach().cpu().numpy()
-    if m.ndim == 2:
-        m = cv2.resize(m, (w, h))
-        mask_bin = (m > 0.5).astype(np.uint8)
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_CLOSE, k, iterations=2)
-    return mask_bin, conf
-
-
-def build_adaptive_skin_mask(rgb: np.ndarray, person_mask: np.ndarray, lm: List[Lm]) -> Tuple[np.ndarray, Dict[str, float]]:
-    h, w = rgb.shape[:2]
-    ycrcb = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)
-
-    face_idx = [0, 1, 2, 3, 4, 5, 6, 9, 10]
-    samples = []
-    for idx in face_idx:
-        x, y = lm_xy(lm, idx, w, h)
-        x1, x2 = max(0, x - 6), min(w, x + 6)
-        y1, y2 = max(0, y - 6), min(h, y + 6)
-        patch = ycrcb[y1:y2, x1:x2, :]
-        if patch.size > 0:
-            samples.append(patch.reshape(-1, 3))
-
-    if len(samples) == 0:
-        lower = np.array([0, 135, 85], dtype=np.uint8)
-        upper = np.array([255, 180, 135], dtype=np.uint8)
-    else:
-        s = np.vstack(samples)
-        mean = s.mean(axis=0)
-        std = s.std(axis=0) + 1e-6
-
-        y_lo = max(25, int(mean[0] - 2.5 * std[0]))
-        y_hi = min(255, int(mean[0] + 2.5 * std[0]))
-        cr_lo = max(120, int(mean[1] - 2.8 * std[1]))
-        cr_hi = min(205, int(mean[1] + 2.8 * std[1]))
-        cb_lo = max(70, int(mean[2] - 2.8 * std[2]))
-        cb_hi = min(170, int(mean[2] + 2.8 * std[2]))
-
-        lower = np.array([y_lo, cr_lo, cb_lo], dtype=np.uint8)
-        upper = np.array([y_hi, cr_hi, cb_hi], dtype=np.uint8)
-
-    skin = cv2.inRange(ycrcb, lower, upper)
-    skin = (skin > 0).astype(np.uint8)
-    skin = cv2.bitwise_and(skin, skin, mask=person_mask)
-
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    skin = cv2.morphologyEx(skin, cv2.MORPH_OPEN, k, iterations=1)
-    skin = cv2.morphologyEx(skin, cv2.MORPH_CLOSE, k, iterations=2)
-
-    stats = {
-        "lower_Y": float(lower[0]), "lower_Cr": float(lower[1]), "lower_Cb": float(lower[2]),
-        "upper_Y": float(upper[0]), "upper_Cr": float(upper[1]), "upper_Cb": float(upper[2]),
-    }
-    return skin, stats
-
-
-def arm_skin_exposure(skin_mask: np.ndarray, lm: List[Lm], w: int, h: int) -> float:
-    def segment_box(i1: int, i2: int, pad: int = 12) -> Tuple[int, int, int, int]:
-        x1, y1 = lm_xy(lm, i1, w, h)
-        x2, y2 = lm_xy(lm, i2, w, h)
-        xa, xb = sorted([x1, x2])
-        ya, yb = sorted([y1, y2])
-        xa = max(0, xa - pad); xb = min(w - 1, xb + pad)
-        ya = max(0, ya - pad); yb = min(h - 1, yb + pad)
-        return xa, ya, xb, yb
-
-    rois = [segment_box(11, 13), segment_box(13, 15), segment_box(12, 14), segment_box(14, 16)]
-    skin_pixels = 0
-    total_pixels = 0
-    for xa, ya, xb, yb in rois:
-        roi = skin_mask[ya:yb, xa:xb]
-        if roi.size == 0:
-            continue
-        skin_pixels += int(roi.sum())
-        total_pixels += int(roi.size)
-    return float(skin_pixels / max(total_pixels, 1))
-
-
-def hood_score(garment_mask: np.ndarray, skin_mask: np.ndarray, lm: List[Lm], w: int, h: int) -> float:
-    _, sh_y = lm_xy(lm, 11, w, h)
-    _, nose_y = lm_xy(lm, 0, w, h)
-    top = max(0, nose_y - int(0.15 * h))
-    bottom = min(h - 1, sh_y + int(0.05 * h))
-
-    left_ear_x, _ = lm_xy(lm, 7, w, h)
-    right_ear_x, _ = lm_xy(lm, 8, w, h)
-    xa = max(0, min(left_ear_x, right_ear_x) - int(0.20 * w))
-    xb = min(w - 1, max(left_ear_x, right_ear_x) + int(0.20 * w))
-
-    gm = garment_mask[top:bottom, xa:xb]
-    sm = skin_mask[top:bottom, xa:xb]
-    if gm.size == 0:
-        return 0.0
-
-    garment_ratio = gm.sum() / gm.size
-    skin_ratio = sm.sum() / max(sm.size, 1)
-    return float(np.clip((garment_ratio * 1.4) - (skin_ratio * 0.6), 0.0, 1.0))
-
-
-def sobel_wrinkle_ratios(gray: np.ndarray) -> Tuple[float, float]:
-    gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=5)
-    gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=5)
-    mx = float(np.sum(np.abs(gx)))
-    my = float(np.sum(np.abs(gy)))
-    total = mx + my + 1e-6
-    return mx / total, my / total
-
-
-def fft_highfreq_ratio(gray: np.ndarray) -> float:
-    gray = gray.astype(np.float32)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-
-    f = np.fft.fft2(gray)
-    fshift = np.fft.fftshift(f)
-    mag = np.abs(fshift) + 1e-6
-
-    h, w = gray.shape
-    cy, cx = h // 2, w // 2
-    yy, xx = np.ogrid[:h, :w]
-    r = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
-    r_norm = r / (max(h, w) / 2 + 1e-6)
-
-    hf = mag[r_norm > 0.55].sum()
-    total = mag.sum()
-    return float(hf / max(total, 1e-6))
-
-
-def backbone_signature(rgb_roi: np.ndarray, model: torch.nn.Module, device: str = "cpu") -> Dict[str, float]:
-    tfm = transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=(0.485, 0.456, 0.406),
-                             std=(0.229, 0.224, 0.225)),
-    ])
-    x = tfm(rgb_roi).unsqueeze(0).to(device)
-    with torch.no_grad():
-        out = model(x)
-        if isinstance(out, (list, tuple)):
-            out = out[0]
-        if out.ndim == 4:
-            feat_std = float(out.std().item())
-            feat_norm = float(out.flatten().norm().item())
-        else:
-            feat_std = float(out.std().item())
-            feat_norm = float(out.norm().item())
-    return {"bb_feat_std": feat_std, "bb_feat_norm": feat_norm}
-
-
-def largest_contour(mask: np.ndarray) -> Optional[np.ndarray]:
-    cnts, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
+def infer_person_mask_yolo(img_bgr: np.ndarray, conf: float = 0.25) -> Optional[np.ndarray]:
+    if YOLO is None:
+        st.warning("ultralytics is not installed; segmentation disabled.")
         return None
-    return sorted(cnts, key=cv2.contourArea, reverse=True)[0]
-
-
-def width_run_at_y(mask: np.ndarray, y: int, center_x: int) -> Tuple[int, int, int]:
-    h, w = mask.shape[:2]
-    y = max(0, min(y, h - 1))
-    row = mask[y, :]
-    if row.sum() == 0:
-        return 0, 0, 0
-    idx = np.where(row > 0)[0]
-    if len(idx) == 0:
-        return 0, 0, 0
-
-    runs = []
-    start = idx[0]
-    prev = idx[0]
-    for v in idx[1:]:
-        if v == prev + 1:
-            prev = v
-        else:
-            runs.append((start, prev))
-            start = v
-            prev = v
-    runs.append((start, prev))
-
-    best = None
-    best_dist = 1e9
-    for a, b in runs:
-        if a <= center_x <= b:
-            best = (a, b)
-            break
-        dist = min(abs(center_x - a), abs(center_x - b))
-        if dist < best_dist:
-            best_dist = dist
-            best = (a, b)
-    if best is None:
-        return 0, 0, 0
-    a, b = best
-    return (b - a), a, b
-
-
-# =========================================================
-# Engine
-# =========================================================
-class FormFoundryMVP:
-    def __init__(self) -> None:
-        self.pose = load_pose_landmarker()
-        self.yolo = load_yolo()
-        self.backbone_name = "swin_tiny_patch4_window7_224"
-        self.backbone = load_material_backbone(self.backbone_name)
-
-    def detect_pose(self, rgb: np.ndarray) -> List[Lm]:
-        rgb = np.ascontiguousarray(rgb)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        r = self.pose.detect(mp_image)
-        if not r.pose_landmarks:
-            return []
-        lms = r.pose_landmarks[0]
-        out: List[Lm] = []
-        for p in lms:
-            out.append(Lm(x=p.x, y=p.y, z=getattr(p, "z", 0.0), visibility=getattr(p, "visibility", 1.0)))
-        return out
-
-    def garment_classify(
-        self, lm: List[Lm], garment_mask: np.ndarray, skin_mask: np.ndarray
-    ) -> Tuple[str, Dict[str, float], str]:
-        h, w = garment_mask.shape[:2]
-        arm_ratio = arm_skin_exposure(skin_mask, lm, w, h)
-        hood = hood_score(garment_mask, skin_mask, lm, w, h)
-
-        # Decision rules (t-shirt 오판 줄이기: 팔 skin 우선)
-        if arm_ratio >= 0.08:
-            g = "Short Sleeve"
-            reason = f"Arm-skin exposure {arm_ratio*100:.0f}% (short sleeve prior)"
-        else:
-            if hood >= 0.38:
-                g = "Hoodie/Sweat"
-                reason = f"Hood/neck coverage score {hood:.2f} (hood prior)"
-            else:
-                g = "Long Sleeve"
-                reason = f"Low arm-skin {arm_ratio*100:.0f}% and no hood dominance (hood={hood:.2f})"
-
-        dbg = {"arm_skin_ratio": float(arm_ratio), "hood_score": float(hood)}
-        return g, dbg, reason
-
-    def material_infer(self, rgb: np.ndarray, garment_mask: np.ndarray, lm: List[Lm]) -> Dict[str, Any]:
-        h, w = rgb.shape[:2]
-
-        # ROI = torso bbox (shoulder~hip)
-        lsx, lsy = lm_xy(lm, 11, w, h)
-        rsx, rsy = lm_xy(lm, 12, w, h)
-        lhx, lhy = lm_xy(lm, 23, w, h)
-        rhx, rhy = lm_xy(lm, 24, w, h)
-
-        xa = max(0, min(lsx, rsx, lhx, rhx) - int(0.10 * w))
-        xb = min(w - 1, max(lsx, rsx, lhx, rhx) + int(0.10 * w))
-        ya = max(0, min(lsy, rsy) - int(0.02 * h))
-        yb = min(h - 1, max(lhy, rhy) + int(0.03 * h))
-
-        roi = rgb[ya:yb, xa:xb]
-        mroi = garment_mask[ya:yb, xa:xb]
-        if roi.size == 0:
-            roi = rgb[max(0, lsy - 60):min(h, lsy + 80), max(0, lsx - 80):min(w, lsx + 80)]
-            mroi = None
-
-        roi_masked = roi.copy()
-        if mroi is not None and mroi.size > 0:
-            roi_masked[mroi == 0] = 0
-
-        gray = cv2.cvtColor(roi_masked, cv2.COLOR_RGB2GRAY)
-        lap = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-        rough_0_10 = float(np.clip(lap / 200.0, 0.0, 10.0))
-        v_ratio, h_ratio = sobel_wrinkle_ratios(gray)
-        hf = fft_highfreq_ratio(gray)
-
-        bb = backbone_signature(roi, self.backbone, device="cpu")
-
-        # thickness score (0..1)
-        thick_score = 0.50 * (rough_0_10 / 10.0) + 0.35 * hf + 0.15 * np.clip(bb["bb_feat_std"], 0.0, 1.0)
-        thick_score = float(np.clip(thick_score, 0.0, 1.0))
-
-        if thick_score >= 0.70:
-            thickness_level = "thick"
-            thickness_cm = 2.4
-            bucket = "knit/fleece"
-        elif thick_score >= 0.40:
-            thickness_level = "medium"
-            thickness_cm = 1.4
-            bucket = "cotton blend"
-        else:
-            thickness_level = "thin"
-            thickness_cm = 0.8
-            bucket = "smooth cotton/synthetic"
-
-        # confidence (MVP)
-        conf = float(np.clip(0.55 + 0.25 * abs(hf - 0.25) + 0.10 * (rough_0_10 / 10.0), 0.0, 0.95))
-
-        return {
-            "roi_rgb": roi,
-            "roughness_0_10": rough_0_10,
-            "wrinkle_v_ratio": float(v_ratio),
-            "wrinkle_h_ratio": float(h_ratio),
-            "fft_highfreq_ratio": float(hf),
-            "backbone": {"name": self.backbone_name, **bb},
-            "material_bucket": bucket,
-            "thickness_level": thickness_level,
-            "thickness_cm": float(thickness_cm),
-            "confidence": conf,
-        }
-
-    def fit_infer(self, mat: Dict[str, Any]) -> Tuple[str, Dict[str, float], str]:
-        v = float(mat["wrinkle_v_ratio"])
-        h = float(mat["wrinkle_h_ratio"])
-        hf = float(mat["fft_highfreq_ratio"])
-        rough = float(mat["roughness_0_10"])
-
-        if v >= 0.62 and hf >= 0.22:
-            fit = "Loose"
-            reason = f"Vertical drape dominates (v={v:.2f}) + highfreq wrinkles (hf={hf:.2f})"
-        elif h >= 0.58 and hf <= 0.22 and rough <= 4.8:
-            fit = "Tight"
-            reason = f"Horizontal tension dominates (h={h:.2f}) + smoother surface (hf={hf:.2f})"
-        else:
-            fit = "Regular"
-            reason = f"Balanced texture vectors (v={v:.2f}, h={h:.2f})"
-
-        dbg = {"v_ratio": v, "h_ratio": h, "hf_ratio": hf, "rough_0_10": rough}
-        return fit, dbg, reason
-
-    def estimate_body_torso_mask(self, person_mask: np.ndarray, lm: List[Lm], px_per_cm: float, width_deduct_cm: float) -> np.ndarray:
-        h, w = person_mask.shape[:2]
-        _, sh_y = lm_xy(lm, 11, w, h)
-        _, hip_y = lm_xy(lm, 23, w, h)
-        y1 = max(0, min(sh_y, hip_y) - int(0.03 * h))
-        y2 = min(h - 1, max(sh_y, hip_y) + int(0.06 * h))
-
-        torso = np.zeros_like(person_mask)
-        torso[y1:y2, :] = person_mask[y1:y2, :]
-
-        # width_deduct_cm 는 "전체 너비 감소" 개념 -> erosion radius는 절반
-        deduct_px = max(0, int(width_deduct_cm * px_per_cm))
-        radius = max(1, int(deduct_px / 2))
-        ksz = radius * 2 + 1
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
-        body = cv2.erode(torso, k, iterations=1)
-        return body
-
-    def measure(self, body_mask: np.ndarray, lm: List[Lm], height_cm: float) -> Tuple[Dict[str, Any], Dict[str, str]]:
-        h, w = body_mask.shape[:2]
-
-        px_per_cm, scale_dbg = estimate_px_per_cm(lm, w, h, height_cm)
-        rot_factor, rot_deg = rotation_compensation(lm)
-
-        center_x = int(((lm[23].x + lm[24].x) / 2) * w)
-
-        y_sh = int(((lm[11].y + lm[12].y) / 2) * h)
-        y_ch = int(((lm[11].y * 2 + lm[23].y) / 3) * h)
-        y_wa = int(((lm[11].y + lm[23].y * 2) / 3) * h)
-        y_hi = int(((lm[23].y + lm[24].y) / 2) * h)
-
-        sh_px = math.hypot((lm[11].x - lm[12].x) * w, (lm[11].y - lm[12].y) * h)
-        sh_cm = (sh_px / px_per_cm) + 1.2  # bias 줄임(1.5->1.2)
-
-        def width_cm_at(y: int) -> Tuple[float, int, int, int]:
-            wp, x1, x2 = width_run_at_y(body_mask, y, center_x)
-            if wp <= 0:
-                return 0.0, 0, 0, 0
-            wp_corr = int(wp * rot_factor)
-            return float(wp_corr / px_per_cm), x1, x2, wp_corr
-
-        ch_w_cm, ch_x1, ch_x2, ch_wp_corr = width_cm_at(y_ch)
-        wa_w_cm, wa_x1, wa_x2, wa_wp_corr = width_cm_at(y_wa)
-        hi_w_cm, hi_x1, hi_x2, hi_wp_corr = width_cm_at(y_hi)
-
-        chest = ch_w_cm * CIRC_RATIO_CHEST
-        waist = wa_w_cm * CIRC_RATIO_WAIST
-        hip = hi_w_cm * CIRC_RATIO_HIP
-
-        def dist(i1: int, i2: int) -> float:
-            return math.hypot((lm[i1].x - lm[i2].x) * w, (lm[i1].y - lm[i2].y) * h)
-
-        arm = (dist(11, 13) + dist(13, 15) + dist(12, 14) + dist(14, 16)) / 2 / px_per_cm
-        leg = (dist(23, 25) + dist(25, 27) + dist(24, 26) + dist(26, 28)) / 2 / px_per_cm
-
-        meas = {
-            "px_per_cm": float(px_per_cm),
-            "rotation_deg": float(rot_deg),
-            "scale_dbg": scale_dbg,
-            "lines": {
-                "y_chest": y_ch, "y_waist": y_wa, "y_hip": y_hi,
-                "ch_x1": ch_x1, "ch_x2": ch_x2,
-                "wa_x1": wa_x1, "wa_x2": wa_x2,
-                "hi_x1": hi_x1, "hi_x2": hi_x2,
-            },
-            "meas_cm": {
-                "Shoulder_Width": float(sh_cm),
-                "Chest_Circ": float(chest),
-                "Waist_Circ": float(waist),
-                "Hip_Circ": float(hip),
-                "Arm_Length": float(arm),
-                "Leg_Length": float(leg),
-            }
-        }
-
-        explain = {
-            "Shoulder_Width": (
-                f"Module02(Pose): dist(shoulder11-12)={sh_px:.0f}px ÷ px_per_cm({px_per_cm:.2f}) + bias(1.2cm). "
-                f"Scale uses mix(span+geodesic) + weak shoulder sanity."
-            ),
-            "Chest_Circ": (
-                f"Module05(BodyMask): at y_chest, center-run width={ch_wp_corr}px ÷ px_per_cm({px_per_cm:.2f}) "
-                f"→ width_cm({ch_w_cm:.1f}) × ratio({CIRC_RATIO_CHEST}). "
-                f"Arms excluded by center-run; rotation corrected."
-            ),
-            "Waist_Circ": (
-                f"Module05(BodyMask): at y_waist, center-run width={wa_wp_corr}px ÷ px_per_cm({px_per_cm:.2f}) "
-                f"→ width_cm({wa_w_cm:.1f}) × ratio({CIRC_RATIO_WAIST})."
-            ),
-            "Hip_Circ": (
-                f"Module05(BodyMask): at y_hip, center-run width={hi_wp_corr}px ÷ px_per_cm({px_per_cm:.2f}) "
-                f"→ width_cm({hi_w_cm:.1f}) × ratio({CIRC_RATIO_HIP})."
-            ),
-            "Arm_Length": (
-                f"Module02(Pose): avg(LS arm + RS arm) "
-                f"= (dist(11-13)+dist(13-15)+dist(12-14)+dist(14-16))/2 ÷ px_per_cm({px_per_cm:.2f})."
-            ),
-            "Leg_Length": (
-                f"Module02(Pose): avg(hip-knee-ankle left/right) "
-                f"= (dist(23-25)+dist(25-27)+dist(24-26)+dist(26-28))/2 ÷ px_per_cm({px_per_cm:.2f})."
-            ),
-        }
-        return meas, explain
-
-    def render_overlay(
-        self,
-        rgb: np.ndarray,
-        lm: List[Lm],
-        person_mask: np.ndarray,
-        garment_mask: np.ndarray,
-        body_mask: np.ndarray,
-        meas: Dict[str, Any],
-    ) -> Dict[str, np.ndarray]:
-        h, w = rgb.shape[:2]
-        base = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
-        # Person overlay (blue-ish) + Garment overlay (green)
-        person_col = np.zeros_like(base); person_col[:] = (255, 120, 0)   # BGR
-        garment_col = np.zeros_like(base); garment_col[:] = (0, 255, 0)
-
-        pm = (person_mask.astype(np.uint8) * 255)
-        gm = (garment_mask.astype(np.uint8) * 255)
-
-        person_col_masked = cv2.bitwise_and(person_col, person_col, mask=pm)
-        garment_col_masked = cv2.bitwise_and(garment_col, garment_col, mask=gm)
-
-        base = cv2.addWeighted(base, 1.0, person_col_masked, 0.16, 0)
-        base = cv2.addWeighted(base, 1.0, garment_col_masked, 0.20, 0)
-
-        # Body contour (red)
-        cnt = largest_contour(body_mask)
-        if cnt is not None and cv2.contourArea(cnt) > 2000:
-            cv2.drawContours(base, [cnt], -1, (0, 0, 255), 3, cv2.LINE_AA)
-
-        # Skeleton
-        draw_skeleton(base, lm)
-
-        # Measurement lines
-        L = meas["lines"]
-        font = cv2.FONT_HERSHEY_SIMPLEX
-
-        def line(y: int, x1: int, x2: int, label: str, color: Tuple[int, int, int]) -> None:
-            if x2 > x1 > 0 and 0 <= y < h:
-                cv2.line(base, (x1, y), (x2, y), color, 3, cv2.LINE_AA)
-                cv2.putText(base, label, (min(x2 + 8, w - 1), max(18, y - 6)), font, 0.65, color, 2, cv2.LINE_AA)
-
-        line(L["y_chest"], L["ch_x1"], L["ch_x2"], "Chest", (0, 255, 255))
-        line(L["y_waist"], L["wa_x1"], L["wa_x2"], "Waist", (255, 0, 255))
-        line(L["y_hip"], L["hi_x1"], L["hi_x2"], "Hip", (0, 255, 0))
-
-        overlay_rgb = cv2.cvtColor(base, cv2.COLOR_BGR2RGB)
-
-        def to_rgb_mask(m: np.ndarray) -> np.ndarray:
-            return np.stack([m * 255, m * 255, m * 255], axis=-1).astype(np.uint8)
-
-        masks_rgb = np.concatenate(
-            [to_rgb_mask(person_mask), to_rgb_mask(garment_mask), to_rgb_mask(body_mask)], axis=1
-        )
-        return {"overlay": overlay_rgb, "masks": masks_rgb}
-
-    def process(self, image_file: Any, height_cm: float) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-        rgb = pil_to_rgb(Image.open(image_file))
-        h, w = rgb.shape[:2]
-
-        # Module 02: Pose
-        lm = self.detect_pose(rgb)
-        if len(lm) < 33:
-            return None, "PoseLandmarker failed: 전신/포즈 인식이 불안정합니다. 더 밝은 배경/전신 프레이밍으로 재시도하세요."
-
-        # Module 03: Person Seg
-        person_mask, yolo_conf = yolo_person_mask(rgb, self.yolo)
-        if person_mask.sum() < 5000:
-            return None, "YOLO person segmentation 실패: 인물이 충분히 크게 나오거나 배경 대비가 있는 사진으로 재시도하세요."
-
-        # Skin vs garment (person - skin)
-        skin_mask, skin_stats = build_adaptive_skin_mask(rgb, person_mask, lm)
-        garment_mask = cv2.bitwise_and(person_mask, (1 - skin_mask).astype(np.uint8))
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        garment_mask = cv2.morphologyEx(garment_mask, cv2.MORPH_CLOSE, k, iterations=2)
-
-        # Module 04: Material
-        mat = self.material_infer(rgb, garment_mask, lm)
-        fit, fit_dbg, fit_reason = self.fit_infer(mat)
-
-        # Garment class
-        garment_class, g_dbg, g_reason = self.garment_classify(lm, garment_mask, skin_mask)
-
-        # Width deduction (Module 05)
-        base_d = GARMENT_DB[garment_class]["base_width_deduct_cm"]
-        ease_d = FIT_DB[fit]["ease_width_deduct_cm"]
-
-        # 소재 두께는 "추정치"라 영향 더 줄임(0.35 -> 0.15)
-        mat_d = float(mat["thickness_cm"] * 0.15)
-
-        width_deduct_cm = float(base_d + ease_d + mat_d)
-
-        # 반팔이면 과도 deduction을 제한(데모에서 제일 튀는 포인트)
-        if garment_class == "Short Sleeve":
-            width_deduct_cm = min(width_deduct_cm, 1.2)
-
-        # scale
-        px_per_cm, scale_dbg = estimate_px_per_cm(lm, w, h, height_cm)
-
-        # body mask estimate
-        body_mask = self.estimate_body_torso_mask(person_mask, lm, px_per_cm, width_deduct_cm)
-
-        # measurements + per-metric explain
-        meas, explain = self.measure(body_mask, lm, height_cm)
-
-        # overlay
-        renders = self.render_overlay(rgb, lm, person_mask, garment_mask, body_mask, meas)
-
-        # reasoning (for expander)
-        reasoning = {
-            "module_02_pose": {
-                "landmarks": 33,
-                "rotation_deg": float(meas["rotation_deg"]),
-                "scale_dbg": scale_dbg,
-            },
-            "module_03_seg": {
-                "yolo_person_conf": float(yolo_conf),
-                "person_area_px": float(person_mask.sum()),
-                "garment_area_px": float(garment_mask.sum()),
-                "skin_area_px": float(skin_mask.sum()),
-                "skin_stats": skin_stats,
-            },
-            "module_04_material": {
-                "bucket": mat["material_bucket"],
-                "thickness_level": mat["thickness_level"],
-                "thickness_cm": mat["thickness_cm"],
-                "confidence": mat["confidence"],
-                "roughness_0_10": mat["roughness_0_10"],
-                "fft_highfreq_ratio": mat["fft_highfreq_ratio"],
-                "wrinkle_v_ratio": mat["wrinkle_v_ratio"],
-                "wrinkle_h_ratio": mat["wrinkle_h_ratio"],
-                "backbone": mat["backbone"],
-            },
-            "module_05_offset": {
-                "garment_class": garment_class,
-                "garment_reason": g_reason,
-                "garment_debug": g_dbg,
-                "fit": fit,
-                "fit_reason": fit_reason,
-                "fit_debug": fit_dbg,
-                "base_width_deduct_cm": base_d,
-                "ease_width_deduct_cm": ease_d,
-                "material_width_deduct_cm": mat_d,
-                "width_deduct_cm_used": width_deduct_cm,
-            },
-        }
-
-        return {
-            "overlay": renders["overlay"],
-            "masks": renders["masks"],
-            "roi": mat["roi_rgb"],
-            "garment_class": garment_class,
-            "garment_reason": g_reason,
-            "fit": fit,
-            "fit_reason": fit_reason,
-            "material_bucket": mat["material_bucket"],
-            "material_conf": mat["confidence"],
-            "deduct_cm": width_deduct_cm,
-            "meas_cm": meas["meas_cm"],
-            "rotation_deg": meas["rotation_deg"],
-            "reasoning": reasoning,
-            "explain": explain,
-        }, None
-
-
-# =========================================================
-# Streamlit UI
-# =========================================================
-st.set_page_config(layout="wide", page_title="FormFoundry MVP — Modules 02/03/04/05")
-
-st.markdown(
-    """
-<style>
-  .card { background-color: #141414; border: 1px solid #2a2a2a; padding: 14px; border-radius: 10px; margin-bottom: 10px; }
-  .card-title { color: #8b8b8b; font-size: 12px; text-transform: uppercase; letter-spacing: 0.7px; margin-bottom: 6px; }
-  .card-value { color: #ffffff; font-size: 22px; font-weight: 700; }
-  .card-sub { color: #b8b8b8; font-size: 13px; line-height: 1.35; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-st.title("FormFoundry MVP — Pose • Segmentation • Material(ViT/Swin) • Volume-Offset")
-st.caption("Module 02/03/04/05를 모두 실제 실행. 각 수치별 계산 근거를 Body Specs 카드 아래에 텍스트로 표시합니다.")
+    model = _get_yolo_seg_model()
+    if model is None:
+        return None
+
+    # Ultralytics expects RGB typically, but works with BGR too; keep as is for speed
+    results = model.predict(img_bgr, conf=conf, iou=0.5, verbose=False)
+    if not results:
+        return None
+    r = results[0]
+    if r.masks is None or r.boxes is None:
+        return None
+
+    names = r.names  # class id -> name
+    cls = r.boxes.cls.detach().cpu().numpy().astype(int)
+    confs = r.boxes.conf.detach().cpu().numpy()
+
+    # pick best "person"
+    best_i = None
+    best_c = -1.0
+    for i, (ci, cf) in enumerate(zip(cls, confs)):
+        if names.get(int(ci), "") == "person":
+            if float(cf) > best_c:
+                best_c = float(cf)
+                best_i = i
+    if best_i is None:
+        return None
+
+    mask = r.masks.data[best_i].detach().cpu().numpy()
+    mask01 = (mask > 0.5).astype(np.uint8)  # HxW
+    return mask01
+
+
+# =========================
+# Measurement helpers
+# =========================
+def row_edges_from_x(mask01: np.ndarray, y: int, x0: int, direction: int) -> Optional[int]:
+    # direction: -1 left, +1 right
+    h, w = mask01.shape
+    y = int(max(0, min(h - 1, y)))
+    row = mask01[y]
+    ones = np.where(row > 0)[0]
+    if ones.size == 0:
+        return None
+
+    x0 = int(max(0, min(w - 1, x0)))
+    if row[x0] == 0:
+        # move x0 to nearest body pixel in this row
+        x0 = int(ones[np.argmin(np.abs(ones - x0))])
+
+    x = x0
+    if direction < 0:
+        while x > 0 and row[x] > 0:
+            x -= 1
+        return x + 1
+    else:
+        while x < w - 1 and row[x] > 0:
+            x += 1
+        return x - 1
+
+
+def center_run_width(mask01: np.ndarray, y: int, center_x: int) -> Optional[Tuple[int, int, int]]:
+    h, w = mask01.shape
+    y = int(max(0, min(h - 1, y)))
+    row = mask01[y]
+    ones = np.where(row > 0)[0]
+    if ones.size == 0:
+        return None
+
+    center_x = int(max(0, min(w - 1, center_x)))
+    if row[center_x] == 0:
+        center_x = int(ones[np.argmin(np.abs(ones - center_x))])
+
+    left = row_edges_from_x(mask01, y, center_x, -1)
+    right = row_edges_from_x(mask01, y, center_x, +1)
+    if left is None or right is None or right <= left:
+        return None
+    width = right - left + 1
+    return left, right, width
+
+
+def estimate_offset_per_side_cm(
+    garment_class: str,
+    material: str,
+    looseness: float,
+    mode: str = "mid",
+) -> float:
+    # mode: "min" | "mid" | "max"
+    lo, hi = GARMENT_PRIORS_CM_PER_SIDE.get(garment_class, (0.3, 0.8))
+    base = {"min": lo, "mid": (lo + hi) / 2.0, "max": hi}.get(mode, (lo + hi) / 2.0)
+
+    adj = MATERIAL_ADJ_CM.get(material, 0.0)
+
+    # looseness: if clothing seems loose/thick, increase offset
+    # Typical: 1.0~1.3 normal, 1.4+ loose
+    loose_boost = 0.0
+    if looseness >= 1.55:
+        loose_boost = 0.6
+    elif looseness >= 1.40:
+        loose_boost = 0.35
+    elif looseness >= 1.25:
+        loose_boost = 0.15
+
+    return float(max(0.0, base + adj + loose_boost))
+
+
+def maybe_erode_mask(mask01: np.ndarray, offset_per_side_cm: float, px_per_cm: float, enabled: bool) -> np.ndarray:
+    if not enabled:
+        return mask01
+    k = int(round(offset_per_side_cm * px_per_cm))
+    if k <= 1:
+        return mask01
+    # kernel should be odd
+    k = k if k % 2 == 1 else k + 1
+    kernel = np.ones((k, k), dtype=np.uint8)
+    eroded = cv2.erode(mask01.astype(np.uint8), kernel, iterations=1)
+    return (eroded > 0).astype(np.uint8)
+
+
+def measure_lengths_from_pose(pose: PoseLandmarks, px_per_cm: float) -> Tuple[Optional[float], Optional[float]]:
+    # Arm length: (11-13-15 + 12-14-16)/2
+    # Leg length: (23-25-27 + 24-26-28)/2
+    def dist(a: int, b: int) -> Optional[float]:
+        if a not in pose.xy or b not in pose.xy:
+            return None
+        ax, ay = pose.xy[a]
+        bx, by = pose.xy[b]
+        return float(math.hypot(ax - bx, ay - by))
+
+    parts_arm = []
+    for (s, e, w) in [(11, 13, 15), (12, 14, 16)]:
+        d1 = dist(s, e)
+        d2 = dist(e, w)
+        if d1 is not None and d2 is not None:
+            parts_arm.append(d1 + d2)
+    arm_px = float(np.mean(parts_arm)) if parts_arm else None
+
+    parts_leg = []
+    for (h, k, a) in [(23, 25, 27), (24, 26, 28)]:
+        d1 = dist(h, k)
+        d2 = dist(k, a)
+        if d1 is not None and d2 is not None:
+            parts_leg.append(d1 + d2)
+    leg_px = float(np.mean(parts_leg)) if parts_leg else None
+
+    arm_cm = None if arm_px is None else arm_px / px_per_cm
+    leg_cm = None if leg_px is None else leg_px / px_per_cm
+    return arm_cm, leg_cm
+
+
+def compute_measurements(
+    mask01: np.ndarray,
+    pose: Optional[PoseLandmarks],
+    px_per_cm: float,
+    garment_class: str,
+    material: str,
+    ratio_mode: str,
+    offset_mode: str,
+    erosion_enabled: bool,
+) -> MeasurementResult:
+    debug = {}
+
+    rotation_deg = estimate_rotation_deg(pose) if pose else 0.0
+    debug["rotation_deg"] = rotation_deg
+
+    h, w = mask01.shape
+
+    # Pose anchors
+    def get_xy(i: int) -> Optional[Tuple[float, float]]:
+        return pose.xy.get(i) if pose and i in pose.xy else None
+
+    shoulderL = get_xy(11)
+    shoulderR = get_xy(12)
+    hipL = get_xy(23)
+    hipR = get_xy(24)
+
+    if shoulderL and shoulderR and hipL and hipR:
+        y_sh = (shoulderL[1] + shoulderR[1]) / 2.0
+        y_hp = (hipL[1] + hipR[1]) / 2.0
+        x_center = (hipL[0] + hipR[0]) / 2.0
+    else:
+        # fallback: use mask bbox
+        ys, xs = np.where(mask01 > 0)
+        if ys.size == 0:
+            return MeasurementResult(
+                px_per_cm=px_per_cm,
+                rotation_deg=rotation_deg,
+                garment_class=garment_class,
+                material=material,
+                offset_per_side_cm=0.0,
+                width_deduct_cm=0.0,
+                shoulder_width_cm=None,
+                chest_circ_cm=None,
+                waist_circ_cm=None,
+                hip_circ_cm=None,
+                arm_len_cm=None,
+                leg_len_cm=None,
+                debug={"reason": "empty_mask"},
+            )
+        y_sh = float(np.percentile(ys, 20))
+        y_hp = float(np.percentile(ys, 60))
+        x_center = float(np.median(xs))
+
+    y_chest = y_sh + 0.28 * (y_hp - y_sh)
+    y_waist = y_sh + 0.55 * (y_hp - y_sh)
+    y_hip = y_sh + 0.82 * (y_hp - y_sh)
+
+    debug["y_levels_px"] = {"shoulder": y_sh, "chest": y_chest, "waist": y_waist, "hip": y_hip}
+
+    # Shoulder width using boundary scan from shoulder joints (reduces arm contamination)
+    shoulder_width_px = None
+    if shoulderL and shoulderR:
+        yS = _safe_int(y_sh, 0, h - 1)
+        xLS = _safe_int(shoulderL[0], 0, w - 1)
+        xRS = _safe_int(shoulderR[0], 0, w - 1)
+        left_edge = row_edges_from_x(mask01, yS, xLS, -1)
+        right_edge = row_edges_from_x(mask01, yS, xRS, +1)
+        if left_edge is not None and right_edge is not None and right_edge > left_edge:
+            shoulder_width_px = right_edge - left_edge + 1
+            debug["shoulder_edges_px"] = {"y": yS, "left": left_edge, "right": right_edge}
+
+    # Looseness proxy: clothed chest width / (pose shoulder joint span)
+    looseness = 1.25
+    pose_shoulder_span_cm = None
+    if shoulderL and shoulderR:
+        pose_span_px = float(abs(shoulderR[0] - shoulderL[0]))
+        pose_shoulder_span_cm = pose_span_px / px_per_cm
+    chest_run = center_run_width(mask01, _safe_int(y_chest, 0, h - 1), _safe_int(x_center, 0, w - 1))
+    if chest_run is not None and pose_shoulder_span_cm and pose_shoulder_span_cm > 1e-6:
+        _, _, chest_w_px = chest_run
+        chest_w_cm = chest_w_px / px_per_cm
+        looseness = float(chest_w_cm / pose_shoulder_span_cm)
+    debug["looseness"] = looseness
+    debug["pose_shoulder_span_cm"] = pose_shoulder_span_cm
+
+    # Offset estimation
+    offset_per_side_cm = estimate_offset_per_side_cm(garment_class, material, looseness, mode=offset_mode)
+    width_deduct_cm = 2.0 * offset_per_side_cm
+
+    # Optional erosion (more “physics-y” demo)
+    mask_use = maybe_erode_mask(mask01, offset_per_side_cm, px_per_cm, enabled=erosion_enabled)
+
+    # Width sampling (after erosion if enabled)
+    def width_cm_at(yf: float) -> Optional[float]:
+        y = _safe_int(yf, 0, h - 1)
+        cx = _safe_int(x_center, 0, w - 1)
+        run = center_run_width(mask_use, y, cx)
+        if run is None:
+            return None
+        _, _, ww = run
+        return float(ww / px_per_cm)
+
+    chest_width_cm = width_cm_at(y_chest)
+    waist_width_cm = width_cm_at(y_waist)
+    hip_width_cm = width_cm_at(y_hip)
+
+    debug["widths_cm_post_erosion"] = {
+        "chest_width_cm": chest_width_cm,
+        "waist_width_cm": waist_width_cm,
+        "hip_width_cm": hip_width_cm,
+    }
+
+    # Shoulder width (use non-eroded for stability, then deduct)
+    shoulder_width_cm = None
+    if shoulder_width_px is not None:
+        shoulder_width_cm = float(shoulder_width_px / px_per_cm)
+
+    # Apply width deduct (if not using erosion, this is the main correction)
+    def corrected_width(width_cm: Optional[float]) -> Optional[float]:
+        if width_cm is None:
+            return None
+        if erosion_enabled:
+            # erosion already baked in; small residual deduct only
+            return float(max(0.0, width_cm))
+        return float(max(0.0, width_cm - width_deduct_cm))
+
+    chest_w_body = corrected_width(chest_width_cm)
+    waist_w_body = corrected_width(waist_width_cm)
+    hip_w_body = corrected_width(hip_width_cm)
+
+    shoulder_w_body = None
+    if shoulder_width_cm is not None:
+        shoulder_w_body = float(max(0.0, shoulder_width_cm - (0.5 * width_deduct_cm)))
+
+    # Ratio: fixed MVP (option hook for learnable later)
+    ratios = DEFAULT_RATIOS.copy()
+
+    # small rotation compensation (demo only)
+    rot_factor = 1.0 + (abs(rotation_deg) / 90.0) * 0.04  # up to ~+1.3%
+    # looseness compensation: if very loose, circumference ratio goes up slightly
+    loose_factor = 1.0 + max(0.0, looseness - 1.3) * 0.03
+
+    if ratio_mode == "fixed":
+        pass
+    elif ratio_mode == "fixed+signals":
+        ratios["chest"] *= rot_factor * loose_factor
+        ratios["waist"] *= (1.0 + max(0.0, looseness - 1.3) * 0.02)
+        ratios["hip"] *= (1.0 + max(0.0, looseness - 1.3) * 0.02)
+
+    debug["ratios_used"] = ratios
+    debug["rot_factor"] = rot_factor
+    debug["loose_factor"] = loose_factor
+
+    # Circumference estimates
+    chest_circ = None if chest_w_body is None else float(chest_w_body * ratios["chest"])
+    waist_circ = None if waist_w_body is None else float(waist_w_body * ratios["waist"])
+    hip_circ = None if hip_w_body is None else float(hip_w_body * ratios["hip"])
+
+    # Pose lengths
+    arm_len_cm, leg_len_cm = (None, None)
+    if pose:
+        arm_len_cm, leg_len_cm = measure_lengths_from_pose(pose, px_per_cm)
+
+    return MeasurementResult(
+        px_per_cm=px_per_cm,
+        rotation_deg=rotation_deg,
+        garment_class=garment_class,
+        material=material,
+        offset_per_side_cm=offset_per_side_cm,
+        width_deduct_cm=width_deduct_cm,
+        shoulder_width_cm=shoulder_w_body,
+        chest_circ_cm=chest_circ,
+        waist_circ_cm=waist_circ,
+        hip_circ_cm=hip_circ,
+        arm_len_cm=arm_len_cm,
+        leg_len_cm=leg_len_cm,
+        debug=debug,
+    )
+
+
+# =========================
+# UI
+# =========================
+st.title("FormFoundry AI — A4 Calibrated Measurement MVP")
 
 with st.sidebar:
-    st.header("Config")
-    height_cm = st.number_input("Height (cm)", 150, 210, 182, step=1)
-    st.caption("Run locally:")
-    st.code("streamlit run app.py", language="bash")
-    st.caption("Pose model will auto-download into ./models/ on first run.")
+    st.header("Mode")
+    mode = st.radio(
+        "측정 모드",
+        ["고정밀 (A4 마커 필수)", "대체 (A4 없이: 대략)"],
+        index=0,
+    )
 
-uploaded = st.file_uploader("Upload full-body image", type=["jpg", "jpeg", "png"])
+    st.header("A4 Calibration")
+    px_per_mm = st.slider("A4 워프 해상도 (px/mm)", min_value=3.0, max_value=10.0, value=6.0, step=0.5)
 
-# init
-try:
-    engine = FormFoundryMVP()
-except Exception as e:
-    st.error("Engine initialization failed.")
-    st.code(str(e))
-    st.stop()
+    st.header("Segmentation")
+    yolo_conf = st.slider("YOLO conf", 0.10, 0.80, 0.25, 0.05)
 
-if uploaded:
-    with st.spinner("Running full pipeline (02/03/04/05)..."):
-        time.sleep(0.15)
-        data, err = engine.process(uploaded, float(height_cm))
+    st.header("Clothing Signals (MVP)")
+    garment_class = st.selectbox(
+        "Garment Class",
+        ["short_sleeve", "long_sleeve", "hoodie", "coat", "puffer", "sleeveless"],
+        index=0,
+    )
+    material = st.selectbox(
+        "Material",
+        ["cotton blend", "thin cotton", "knit", "wool", "leather", "down", "synthetic", "unknown"],
+        index=0,
+    )
 
-    if err:
-        st.error(err)
+    st.header("Volume-Offset")
+    offset_mode = st.selectbox("두께 범위 선택", ["min", "mid", "max"], index=1)
+    erosion_enabled = st.checkbox("마스크 erosion 적용(시각 데모용)", value=False)
+
+    st.header("Circumference Ratio")
+    ratio_mode = st.selectbox("ratio 모드", ["fixed", "fixed+signals"], index=1)
+
+    st.header("Export")
+    export_json = st.checkbox("결과 JSON 출력", value=True)
+
+    # Offer marker sheet download if present on server
+    marker_pdf_path = "/mnt/data/FormFoundry_A4_MarkerSheet_v1_1.pdf"
+    try:
+        with open(marker_pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+        st.download_button(
+            "A4 마커 시트 PDF 다운로드",
+            data=pdf_bytes,
+            file_name="FormFoundry_A4_MarkerSheet_v1_1.pdf",
+            mime="application/pdf",
+        )
+    except Exception:
+        pass
+
+
+colL, colR = st.columns([1.1, 0.9])
+
+with colL:
+    st.subheader("Input")
+    uploaded = st.file_uploader("전신 사진 업로드 (A4 마커 포함 권장)", type=["jpg", "jpeg", "png", "webp"])
+    use_camera = st.checkbox("카메라로 촬영 (가능하면)", value=False)
+    camera_img = None
+    if use_camera:
+        camera_img = st.camera_input("Capture")
+
+    if cv2 is None:
+        st.error("OpenCV unavailable.")
         st.stop()
 
-    col1, col2, col3 = st.columns([1.35, 0.95, 0.95])
+    if uploaded is None and camera_img is None:
+        st.info("이미지를 업로드하거나 카메라 촬영을 해주세요.")
+        st.stop()
 
-    with col1:
-        st.markdown("#### Visual Output")
-        t1, t2, t3 = st.tabs(["Overlay", "Masks", "ROI"])
-        with t1:
-            st.image(
-                data["overlay"],
-                use_container_width=True,
-                caption="Overlay: Person(blue) + Garment(green) + Body contour(red) + Skeleton + Measure lines",
-            )
-        with t2:
-            st.image(
-                data["masks"],
-                use_container_width=True,
-                caption="Masks: Person | Garment(person-skin) | Body estimate (erosion offset)",
-            )
-        with t3:
-            st.image(data["roi"], use_container_width=True, caption="Torso ROI (Material inference input)")
+    try:
+        if camera_img is not None:
+            img_bgr = _read_image(camera_img)
+        else:
+            img_bgr = _read_image(uploaded)
+    except Exception as e:
+        st.error(f"이미지 로드 실패: {e}")
+        st.stop()
 
-    with col2:
-        st.markdown("#### Module Summary (시연용)")
-        rot = data["rotation_deg"]
-        deduct = data["deduct_cm"]
+    st.image(_to_rgb(img_bgr), caption="Original", width="stretch")
 
-        st.markdown(
-            f"""
-<div class="card">
-  <div class="card-title">Module 02 — Pose</div>
-  <div class="card-value">{rot:.1f}° rotation</div>
-  <div class="card-sub">Shoulder depth 기반 회전 보정값이 측정에 반영됩니다.</div>
-</div>
-<div class="card">
-  <div class="card-title">Module 03 — Garment Class</div>
-  <div class="card-value">{data["garment_class"]}</div>
-  <div class="card-sub">{data["garment_reason"]}</div>
-</div>
-<div class="card">
-  <div class="card-title">Module 04 — Material (Swin 실행)</div>
-  <div class="card-value" style="font-size:18px;">{data["material_bucket"]}</div>
-  <div class="card-sub">confidence: {data["material_conf"]:.2f}</div>
-</div>
-<div class="card">
-  <div class="card-title">Module 05 — Volume-Offset</div>
-  <div class="card-value">Width deduct: -{deduct:.1f} cm</div>
-  <div class="card-sub">의복/air-gap/소재 두께를 합산해 body contour를 안쪽으로 복원(erosion)합니다.</div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
 
-        with st.expander("Demo용 상세 수치(원하면 펼치기)"):
-            st.json(data["reasoning"])
+# --- Calibration ---
+calib = None
+if mode.startswith("고정밀"):
+    calib = detect_a4_calibration(img_bgr, px_per_mm=px_per_mm, dict_name=MARKER_DICT_NAME)
+    if not calib.ok:
+        with colR:
+            st.subheader("A4 Calibration")
+            st.error(f"A4 마커 인식 실패: {calib.debug}")
+            st.write("팁: 마커(0,1,2,3)가 네 모서리에 모두 보이게, 반사 없이, 너무 작지 않게 촬영하세요.")
+        st.stop()
 
-    with col3:
-        st.markdown("#### Body Specs (Output)")
-        m = data["meas_cm"]
-        ex = data.get("explain", {})
+    warped_bgr = warp_to_a4(img_bgr, calib)
+    with colR:
+        st.subheader("A4 Rectified")
+        st.image(_to_rgb(warped_bgr), caption="Warped to A4 plane", width="stretch")
+        st.caption(f"px/mm = {calib.px_per_mm:.2f}  |  A4(px) = {calib.a4_size_px}")
 
-        def card(label: str, val: float, explain: str) -> None:
-            explain = explain or "-"
-            st.markdown(
-                f"""
-<div class="card">
-  <div class="card-title">{label}</div>
-  <div class="card-value">{val:.1f} cm</div>
-  <div class="card-sub"><b>Calculation:</b> {explain}</div>
-</div>
-""",
-                unsafe_allow_html=True,
-            )
+    px_per_cm = float(px_per_mm * 10.0)
+else:
+    calib = None
+    # crude fallback: ask height to estimate px/cm from pose later; if no pose, no scale.
+    with colR:
+        st.subheader("Fallback Mode")
+        height_cm = st.number_input("키 입력(cm) — A4 없을 때만", min_value=120.0, max_value=220.0, value=175.0, step=0.5)
+    # temporary default; later refined if pose is available
+    px_per_cm = 14.0  # placeholder; will be overwritten if pose-based scale is computed
 
-        card("Shoulder Width", m["Shoulder_Width"], ex.get("Shoulder_Width", ""))
-        card("Chest Circumference", m["Chest_Circ"], ex.get("Chest_Circ", ""))
-        card("Waist Circumference", m["Waist_Circ"], ex.get("Waist_Circ", ""))
-        card("Hip Circumference", m["Hip_Circ"], ex.get("Hip_Circ", ""))
 
-        cA, cB = st.columns(2)
-        with cA:
-            card("Arm Length", m["Arm_Length"], ex.get("Arm_Length", ""))
-        with cB:
-            card("Leg Length", m["Leg_Length"], ex.get("Leg_Length", ""))
+# --- Pose ---
+pose = infer_pose_landmarks(img_bgr, calib if mode.startswith("고정밀") else None)
+if pose is None:
+    st.warning("Pose 추론 실패(또는 mediapipe 미설치). 측정 일부가 제한될 수 있습니다.")
 
-        st.button("Save Profile (MVP)", type="primary", use_container_width=True)
+# --- Segmentation ---
+mask01 = infer_person_mask_yolo(img_bgr, conf=yolo_conf)
+if mask01 is None:
+    st.error("인물 마스크 추론 실패. (YOLO/seg 모델 또는 person 검출 문제)")
+    st.stop()
+
+# Warp mask if calibrated
+if mode.startswith("고정밀") and calib and calib.ok:
+    mask_a4 = warp_mask_to_a4(mask01, calib)
+    work_mask = mask_a4
+else:
+    work_mask = mask01
+
+# If fallback mode, estimate px_per_cm from pose + height (very rough)
+if not mode.startswith("고정밀"):
+    if pose and mp is not None:
+        # Estimate pixel height: nose(0) to ankles(27/28) or heel(29/30) fallback
+        def get(i): return pose.xy.get(i) if pose and i in pose.xy else None
+        top = get(0) or get(11) or get(12)
+        aL = get(27) or get(29)
+        aR = get(28) or get(30)
+        if top and aL and aR:
+            y_top = top[1]
+            y_bot = max(aL[1], aR[1])
+            pix_h = max(1.0, y_bot - y_top)
+            px_per_cm = float(pix_h / height_cm)
+
+# Overlay preview
+with colR:
+    st.subheader("Mask Preview")
+    vis = np.dstack([work_mask * 255, work_mask * 255, work_mask * 255]).astype(np.uint8)
+    st.image(vis, caption="Person mask (working plane)", width="stretch")
+    st.caption(f"px/cm = {px_per_cm:.2f}")
+
+# --- Measurements ---
+result = compute_measurements(
+    mask01=work_mask,
+    pose=pose,
+    px_per_cm=px_per_cm,
+    garment_class=garment_class,
+    material=material,
+    ratio_mode=ratio_mode,
+    offset_mode=offset_mode,
+    erosion_enabled=erosion_enabled,
+)
+
+# =========================
+# Output
+# =========================
+st.subheader("Module Summary (시연용)")
+
+rot_txt = f"{result.rotation_deg:.1f}° rotation"
+offset_txt = f"Width deduct: -{result.width_deduct_cm:.1f} cm"
+thick_txt = f"offset(per-side): {result.offset_per_side_cm:.2f} cm"
+
+summary_lines = [
+    "Module 02 — Pose",
+    rot_txt,
+    "Shoulder depth 기반 회전 보정값이 측정에 반영됩니다.",
+    "",
+    "Module 03 — Person Mask",
+    "YOLOv8-seg 기반 person 마스크로 신체 외곽을 픽셀 단위로 확보합니다.",
+    "",
+    "Module 04 — Material (MVP)",
+    f"{result.material}",
+    "confidence: (MVP에서는 UI 선택/placeholder)",
+    "",
+    "Module 05 — Volume-Offset",
+    offset_txt,
+    "의복/air-gap/소재 두께 신호를 합산해 body contour를 안쪽으로 복원(erosion 또는 width 차감)합니다.",
+    f"({thick_txt})",
+]
+st.code("\n".join(summary_lines), language="text")
+
+st.subheader("Body Specs (Output)")
+
+def fmt(v: Optional[float]) -> str:
+    return "-" if v is None else f"{v:.1f} cm"
+
+out_cols = st.columns(2)
+with out_cols[0]:
+    st.metric("Shoulder Width", fmt(result.shoulder_width_cm))
+    st.metric("Chest Circumference", fmt(result.chest_circ_cm))
+    st.metric("Waist Circumference", fmt(result.waist_circ_cm))
+with out_cols[1]:
+    st.metric("Hip Circumference", fmt(result.hip_circ_cm))
+    st.metric("Arm Length", fmt(result.arm_len_cm))
+    st.metric("Leg Length", fmt(result.leg_len_cm))
+
+st.subheader("계산 로직(짧게)")
+logic_lines = [
+    f"- 스케일(px/cm): {result.px_per_cm:.2f}",
+    "- 고정밀 모드: A4 마커를 Homography로 A4 평면에 정렬 → 같은 좌표계에서 Pose/Mask를 측정",
+    "- chest/waist/hip: 마스크에서 해당 y 라인의 center-run 폭(px) → cm 변환 → ratio로 둘레 추정",
+    "- volume-offset: garment class + material + looseness로 per-side 두께(cm) 추정 → 폭에서 2배 차감 또는 erosion",
+]
+st.write("\n".join(logic_lines))
+
+if export_json:
+    st.subheader("Export JSON")
+    payload = {
+        "px_per_cm": result.px_per_cm,
+        "rotation_deg": result.rotation_deg,
+        "garment_class": result.garment_class,
+        "material": result.material,
+        "offset_per_side_cm": result.offset_per_side_cm,
+        "width_deduct_cm": result.width_deduct_cm,
+        "shoulder_width_cm": result.shoulder_width_cm,
+        "chest_circ_cm": result.chest_circ_cm,
+        "waist_circ_cm": result.waist_circ_cm,
+        "hip_circ_cm": result.hip_circ_cm,
+        "arm_len_cm": result.arm_len_cm,
+        "leg_len_cm": result.leg_len_cm,
+        "debug": result.debug,
+    }
+    st.code(json.dumps(payload, ensure_ascii=False, indent=2), language="json")
