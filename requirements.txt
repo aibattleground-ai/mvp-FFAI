@@ -1,0 +1,9 @@
+streamlit
+numpy==1.26.4
+pillow
+opencv-python-headless==4.11.0.86
+ultralytics
+torch
+torchvision
+timm
+mediapipe==0.10.31
