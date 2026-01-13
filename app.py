@@ -1,14 +1,14 @@
 # app.py
 # FormFoundry AI — A4 Marker (PnP/Homography) Calibrated Measurement MVP
-# Drop-in replacement for your existing Streamlit app.py
+# 안정화 패치 포함: ArUco(OpenCV) 호환, assets 상대경로, Streamlit image width 호환
 
 from __future__ import annotations
 
-import io
 import json
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import streamlit as st
@@ -16,7 +16,7 @@ import streamlit as st
 # --- Optional / heavy deps (guarded) ---
 try:
     import cv2
-except Exception as e:
+except Exception:
     cv2 = None
 
 try:
@@ -41,21 +41,15 @@ st.set_page_config(
 A4_W_MM = 210.0
 A4_H_MM = 297.0
 
-# Marker sheet design assumptions (matches provided PDF preview well)
+# Marker sheet design assumptions (your PDF preview 기준)
 MARKER_DICT_NAME = "DICT_4X4_50"
 MARKER_IDS_REQUIRED = {0, 1, 2, 3}
-MARKER_SIDE_MM = 45.0     # approx from PDF (works well)
-MARGIN_MM = 10.0          # approx from PDF (works well)
+MARKER_SIDE_MM = 45.0
+MARGIN_MM = 10.0
 
-# Default fixed ratios (MVP)
-DEFAULT_RATIOS = {
-    "chest": 2.25,
-    "waist": 2.15,
-    "hip": 2.20,
-}
+DEFAULT_RATIOS = {"chest": 2.25, "waist": 2.15, "hip": 2.20}
 
 GARMENT_PRIORS_CM_PER_SIDE = {
-    # "per side" thickness+ease proxy (start point)
     "sleeveless": (0.2, 0.5),
     "short_sleeve": (0.2, 0.6),
     "long_sleeve": (0.3, 0.8),
@@ -63,7 +57,6 @@ GARMENT_PRIORS_CM_PER_SIDE = {
     "coat": (1.2, 2.5),
     "puffer": (2.0, 4.0),
 }
-
 MATERIAL_ADJ_CM = {
     "cotton blend": -0.1,
     "thin cotton": -0.2,
@@ -75,15 +68,22 @@ MATERIAL_ADJ_CM = {
     "unknown": 0.0,
 }
 
+# assets 위치: main/main/assets/*
+ASSET_DIR = Path(__file__).resolve().parent / "assets"
+MARKER_PDF = ASSET_DIR / "FormFoundry_A4_MarkerSheet_v1_1.pdf"
+DEMO_IMAGE_CANDIDATES = [
+    ASSET_DIR / "demo_front.jpg",
+    ASSET_DIR / "demo_front.jpeg",
+    ASSET_DIR / "demo_front.png",
+]
+
 
 # =========================
 # Data classes
 # =========================
 @dataclass
 class PoseLandmarks:
-    # Pixel coords in the WORKING plane (rectified A4 px if available, else original image px)
     xy: Dict[int, Tuple[float, float]]
-    # mediapipe z (relative) for rotation hint if available
     z: Dict[int, float]
 
 
@@ -117,21 +117,37 @@ class MeasurementResult:
 
 
 # =========================
+# Streamlit compatibility helpers
+# =========================
+def st_image_compat(img, caption: str = ""):
+    """
+    Streamlit 버전에 따라 st.image 파라미터가 달라서
+    width='stretch' 지원 안 하는 환경에서도 안 죽게 보호.
+    """
+    try:
+        st.image(img, caption=caption, width="stretch")
+        return
+    except TypeError:
+        pass
+
+    # 구버전 fallback
+    try:
+        st.image(img, caption=caption, use_container_width=True)  # deprecated지만 구버전 호환용
+        return
+    except TypeError:
+        st.image(img, caption=caption)
+
+
+# =========================
 # Utility
 # =========================
 def _require_cv2():
     if cv2 is None:
-        st.error("OpenCV(cv2) import failed. Please ensure opencv-python is installed.")
+        st.error("OpenCV(cv2) import failed. requirements에 opencv-contrib-python(-headless) 포함 여부를 확인하세요.")
         st.stop()
     if not hasattr(cv2, "aruco"):
-        st.error(
-            "cv2.aruco is not available. Install opencv-contrib-python (not opencv-python only)."
-        )
+        st.error("cv2.aruco가 없습니다. opencv-contrib-python(-headless)가 필요합니다.")
         st.stop()
-
-
-def _to_bgr(img_rgb: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
 
 def _to_rgb(img_bgr: np.ndarray) -> np.ndarray:
@@ -148,7 +164,6 @@ def _read_image(file) -> np.ndarray:
 
 
 def _apply_homography_pts(pts_xy: np.ndarray, H: np.ndarray) -> np.ndarray:
-    # pts_xy: (N,2)
     pts = pts_xy.reshape(-1, 1, 2).astype(np.float32)
     out = cv2.perspectiveTransform(pts, H)
     return out.reshape(-1, 2)
@@ -159,61 +174,67 @@ def _safe_int(v: float, lo: int, hi: int) -> int:
 
 
 # =========================
-# A4 marker detection & rectification
+# ArUco detection (OpenCV 호환)
 # =========================
 def _aruco_dict_by_name(name: str):
     aruco = cv2.aruco
-    if not hasattr(aruco, name):
-        raise ValueError(f"Unknown aruco dict name: {name}")
-    return aruco.getPredefinedDictionary(getattr(aruco, name))
+    if hasattr(aruco, name):
+        return aruco.getPredefinedDictionary(getattr(aruco, name))
+    raise ValueError(f"Unknown aruco dict name: {name}")
+
+
+def _aruco_detect_markers(img_bgr: np.ndarray, dict_name: str):
+    """
+    OpenCV 버전에 따라:
+    - 최신: cv2.aruco.ArucoDetector
+    - 구버전: cv2.aruco.detectMarkers + DetectorParameters_create
+    둘 다 지원.
+    """
+    aruco = cv2.aruco
+    d = _aruco_dict_by_name(dict_name)
+
+    # parameters
+    if hasattr(aruco, "DetectorParameters"):
+        params = aruco.DetectorParameters()
+    else:
+        params = aruco.DetectorParameters_create()
+
+    if hasattr(aruco, "ArucoDetector"):
+        detector = aruco.ArucoDetector(d, params)
+        corners, ids, rej = detector.detectMarkers(img_bgr)
+        return corners, ids, rej
+
+    corners, ids, rej = aruco.detectMarkers(img_bgr, d, parameters=params)
+    return corners, ids, rej
 
 
 def _marker_centers_mm() -> Dict[int, Tuple[float, float]]:
-    # Center positions for 4 corner markers on the A4 sheet plane (mm)
-    # origin: top-left of paper
     cx = MARGIN_MM + MARKER_SIDE_MM / 2.0
     cy = MARGIN_MM + MARKER_SIDE_MM / 2.0
     right_cx = A4_W_MM - cx
     bot_cy = A4_H_MM - cy
     return {
-        0: (cx, cy),          # top-left
-        1: (right_cx, cy),    # top-right
-        2: (right_cx, bot_cy),# bottom-right
-        3: (cx, bot_cy),      # bottom-left
+        0: (cx, cy),
+        1: (right_cx, cy),
+        2: (right_cx, bot_cy),
+        3: (cx, bot_cy),
     }
 
 
 def _marker_object_corners_mm(marker_id: int) -> np.ndarray:
-    # returns 4x2 corners in mm in order: tl,tr,br,bl
     centers = _marker_centers_mm()
-    if marker_id not in centers:
-        raise ValueError("Unexpected marker id")
     cx, cy = centers[marker_id]
     h = MARKER_SIDE_MM / 2.0
     return np.array(
-        [
-            [cx - h, cy - h],
-            [cx + h, cy - h],
-            [cx + h, cy + h],
-            [cx - h, cy + h],
-        ],
+        [[cx - h, cy - h], [cx + h, cy - h], [cx + h, cy + h], [cx - h, cy + h]],
         dtype=np.float32,
     )
 
 
-def detect_a4_calibration(
-    img_bgr: np.ndarray,
-    px_per_mm: float = 6.0,
-    dict_name: str = MARKER_DICT_NAME,
-) -> A4Calib:
+def detect_a4_calibration(img_bgr: np.ndarray, px_per_mm: float, dict_name: str) -> A4Calib:
     _require_cv2()
 
-    aruco = cv2.aruco
-    d = _aruco_dict_by_name(dict_name)
-    params = aruco.DetectorParameters()
-    detector = aruco.ArucoDetector(d, params)
-
-    corners, ids, _rej = detector.detectMarkers(img_bgr)
+    corners, ids, _rej = _aruco_detect_markers(img_bgr, dict_name=dict_name)
     if ids is None or len(ids) == 0:
         return A4Calib(ok=False, debug={"reason": "no_markers"})
 
@@ -223,15 +244,13 @@ def detect_a4_calibration(
     if missing:
         return A4Calib(ok=False, debug={"reason": "missing_markers", "missing": missing, "found": ids_list})
 
-    # Build correspondence using ALL marker corners (16 points) for robust homography.
-    img_pts = []
-    obj_pts = []
+    img_pts, obj_pts = [], []
     for c, mid in zip(corners, ids.flatten()):
         mid = int(mid)
         if mid not in MARKER_IDS_REQUIRED:
             continue
-        c2 = c.reshape(-1, 2).astype(np.float32)  # tl,tr,br,bl in image
-        obj = _marker_object_corners_mm(mid)      # tl,tr,br,bl in mm
+        c2 = c.reshape(-1, 2).astype(np.float32)      # tl,tr,br,bl
+        obj = _marker_object_corners_mm(mid)          # tl,tr,br,bl (mm)
         img_pts.append(c2)
         obj_pts.append(obj)
 
@@ -242,6 +261,7 @@ def detect_a4_calibration(
     if H_img2mm is None:
         return A4Calib(ok=False, debug={"reason": "homography_failed"})
 
+    # mm -> px scale on A4 plane
     S = np.array([[px_per_mm, 0, 0], [0, px_per_mm, 0], [0, 0, 1]], dtype=np.float64)
     H_img2px = S @ H_img2mm
 
@@ -254,25 +274,17 @@ def detect_a4_calibration(
         H_img2px=H_img2px,
         px_per_mm=px_per_mm,
         a4_size_px=(a4_w_px, a4_h_px),
-        debug={
-            "markers_found": ids_list,
-            "px_per_mm": px_per_mm,
-            "a4_size_px": (a4_w_px, a4_h_px),
-        },
+        debug={"markers_found": ids_list, "px_per_mm": px_per_mm, "a4_size_px": (a4_w_px, a4_h_px)},
     )
 
 
 def warp_to_a4(img_bgr: np.ndarray, calib: A4Calib) -> np.ndarray:
-    assert calib.ok and calib.H_img2px is not None and calib.a4_size_px is not None
-    w_px, h_px = calib.a4_size_px[0], calib.a4_size_px[1]
-    warped = cv2.warpPerspective(img_bgr, calib.H_img2px, (w_px, h_px))
-    return warped
+    w_px, h_px = calib.a4_size_px
+    return cv2.warpPerspective(img_bgr, calib.H_img2px, (w_px, h_px))
 
 
 def warp_mask_to_a4(mask01: np.ndarray, calib: A4Calib) -> np.ndarray:
-    # mask01 shape HxW uint8 {0,1}
-    assert calib.ok and calib.H_img2px is not None and calib.a4_size_px is not None
-    w_px, h_px = calib.a4_size_px[0], calib.a4_size_px[1]
+    w_px, h_px = calib.a4_size_px
     warped = cv2.warpPerspective(mask01.astype(np.uint8) * 255, calib.H_img2px, (w_px, h_px), flags=cv2.INTER_NEAREST)
     return (warped > 127).astype(np.uint8)
 
@@ -293,58 +305,42 @@ def _get_pose_model():
     )
 
 
-def infer_pose_landmarks(
-    img_bgr: np.ndarray,
-    calib: Optional[A4Calib],
-) -> Optional[PoseLandmarks]:
+def infer_pose_landmarks(img_bgr: np.ndarray, calib: Optional[A4Calib]) -> Optional[PoseLandmarks]:
     if mp is None:
-        st.warning("mediapipe is not installed; pose module disabled.")
         return None
-
-    pose_model = _get_pose_model()
-    if pose_model is None:
+    model = _get_pose_model()
+    if model is None:
         return None
 
     img_rgb = _to_rgb(img_bgr)
     h, w = img_rgb.shape[:2]
-    res = pose_model.process(img_rgb)
+    res = model.process(img_rgb)
     if not res.pose_landmarks:
         return None
 
-    xy = {}
-    z = {}
+    xy, z = {}, {}
     for idx, lm in enumerate(res.pose_landmarks.landmark):
-        x_px = lm.x * w
-        y_px = lm.y * h
+        xy[idx] = (float(lm.x * w), float(lm.y * h))
         z[idx] = float(lm.z)
-        xy[idx] = (float(x_px), float(y_px))
 
-    # If calibrated, map to rectified A4 pixel plane
-    if calib is not None and calib.ok and calib.H_img2px is not None:
+    if calib is not None and calib.ok:
         pts = np.array(list(xy.values()), dtype=np.float32)
         pts2 = _apply_homography_pts(pts, calib.H_img2px)
-        xy2 = {}
-        for i, k in enumerate(list(xy.keys())):
-            xy2[k] = (float(pts2[i, 0]), float(pts2[i, 1]))
-        xy = xy2
+        xy = {k: (float(pts2[i, 0]), float(pts2[i, 1])) for i, k in enumerate(list(xy.keys()))}
 
     return PoseLandmarks(xy=xy, z=z)
 
 
 def estimate_rotation_deg(pose: PoseLandmarks) -> float:
-    # Shoulder depth-based yaw proxy
-    # MediaPipe: left_shoulder=11, right_shoulder=12
     if 11 not in pose.xy or 12 not in pose.xy:
         return 0.0
-    # use mediapipe z if available
     zL = pose.z.get(11, 0.0)
     zR = pose.z.get(12, 0.0)
-    xL, yL = pose.xy[11]
-    xR, yR = pose.xy[12]
+    xL, _ = pose.xy[11]
+    xR, _ = pose.xy[12]
     shoulder_span = max(1e-6, abs(xR - xL))
     dz = (zR - zL)
-    # normalized-ish; clamp to keep stable
-    rot = math.degrees(math.atan2(dz, shoulder_span / 1000.0))  # heuristic scaling
+    rot = math.degrees(math.atan2(dz, shoulder_span / 1000.0))
     return float(max(-30.0, min(30.0, rot)))
 
 
@@ -360,13 +356,11 @@ def _get_yolo_seg_model():
 
 def infer_person_mask_yolo(img_bgr: np.ndarray, conf: float = 0.25) -> Optional[np.ndarray]:
     if YOLO is None:
-        st.warning("ultralytics is not installed; segmentation disabled.")
         return None
     model = _get_yolo_seg_model()
     if model is None:
         return None
 
-    # Ultralytics expects RGB typically, but works with BGR too; keep as is for speed
     results = model.predict(img_bgr, conf=conf, iou=0.5, verbose=False)
     if not results:
         return None
@@ -374,31 +368,26 @@ def infer_person_mask_yolo(img_bgr: np.ndarray, conf: float = 0.25) -> Optional[
     if r.masks is None or r.boxes is None:
         return None
 
-    names = r.names  # class id -> name
+    names = r.names
     cls = r.boxes.cls.detach().cpu().numpy().astype(int)
     confs = r.boxes.conf.detach().cpu().numpy()
 
-    # pick best "person"
-    best_i = None
-    best_c = -1.0
+    best_i, best_c = None, -1.0
     for i, (ci, cf) in enumerate(zip(cls, confs)):
-        if names.get(int(ci), "") == "person":
-            if float(cf) > best_c:
-                best_c = float(cf)
-                best_i = i
+        if names.get(int(ci), "") == "person" and float(cf) > best_c:
+            best_c = float(cf)
+            best_i = i
     if best_i is None:
         return None
 
     mask = r.masks.data[best_i].detach().cpu().numpy()
-    mask01 = (mask > 0.5).astype(np.uint8)  # HxW
-    return mask01
+    return (mask > 0.5).astype(np.uint8)
 
 
 # =========================
 # Measurement helpers
 # =========================
 def row_edges_from_x(mask01: np.ndarray, y: int, x0: int, direction: int) -> Optional[int]:
-    # direction: -1 left, +1 right
     h, w = mask01.shape
     y = int(max(0, min(h - 1, y)))
     row = mask01[y]
@@ -408,7 +397,6 @@ def row_edges_from_x(mask01: np.ndarray, y: int, x0: int, direction: int) -> Opt
 
     x0 = int(max(0, min(w - 1, x0)))
     if row[x0] == 0:
-        # move x0 to nearest body pixel in this row
         x0 = int(ones[np.argmin(np.abs(ones - x0))])
 
     x = x0
@@ -442,20 +430,11 @@ def center_run_width(mask01: np.ndarray, y: int, center_x: int) -> Optional[Tupl
     return left, right, width
 
 
-def estimate_offset_per_side_cm(
-    garment_class: str,
-    material: str,
-    looseness: float,
-    mode: str = "mid",
-) -> float:
-    # mode: "min" | "mid" | "max"
+def estimate_offset_per_side_cm(garment_class: str, material: str, looseness: float, mode: str = "mid") -> float:
     lo, hi = GARMENT_PRIORS_CM_PER_SIDE.get(garment_class, (0.3, 0.8))
     base = {"min": lo, "mid": (lo + hi) / 2.0, "max": hi}.get(mode, (lo + hi) / 2.0)
-
     adj = MATERIAL_ADJ_CM.get(material, 0.0)
 
-    # looseness: if clothing seems loose/thick, increase offset
-    # Typical: 1.0~1.3 normal, 1.4+ loose
     loose_boost = 0.0
     if looseness >= 1.55:
         loose_boost = 0.6
@@ -473,16 +452,13 @@ def maybe_erode_mask(mask01: np.ndarray, offset_per_side_cm: float, px_per_cm: f
     k = int(round(offset_per_side_cm * px_per_cm))
     if k <= 1:
         return mask01
-    # kernel should be odd
     k = k if k % 2 == 1 else k + 1
     kernel = np.ones((k, k), dtype=np.uint8)
     eroded = cv2.erode(mask01.astype(np.uint8), kernel, iterations=1)
     return (eroded > 0).astype(np.uint8)
 
 
-def measure_lengths_from_pose(pose: PoseLandmarks, px_per_cm: float) -> Tuple[Optional[float], Optional[float]]:
-    # Arm length: (11-13-15 + 12-14-16)/2
-    # Leg length: (23-25-27 + 24-26-28)/2
+def measure_lengths_from_pose(pose: PoseLandmarks, px_per_cm: float):
     def dist(a: int, b: int) -> Optional[float]:
         if a not in pose.xy or b not in pose.xy:
             return None
@@ -492,16 +468,14 @@ def measure_lengths_from_pose(pose: PoseLandmarks, px_per_cm: float) -> Tuple[Op
 
     parts_arm = []
     for (s, e, w) in [(11, 13, 15), (12, 14, 16)]:
-        d1 = dist(s, e)
-        d2 = dist(e, w)
+        d1, d2 = dist(s, e), dist(e, w)
         if d1 is not None and d2 is not None:
             parts_arm.append(d1 + d2)
     arm_px = float(np.mean(parts_arm)) if parts_arm else None
 
     parts_leg = []
     for (h, k, a) in [(23, 25, 27), (24, 26, 28)]:
-        d1 = dist(h, k)
-        d2 = dist(k, a)
+        d1, d2 = dist(h, k), dist(k, a)
         if d1 is not None and d2 is not None:
             parts_leg.append(d1 + d2)
     leg_px = float(np.mean(parts_leg)) if parts_leg else None
@@ -522,42 +496,30 @@ def compute_measurements(
     erosion_enabled: bool,
 ) -> MeasurementResult:
     debug = {}
-
     rotation_deg = estimate_rotation_deg(pose) if pose else 0.0
     debug["rotation_deg"] = rotation_deg
 
     h, w = mask01.shape
 
-    # Pose anchors
-    def get_xy(i: int) -> Optional[Tuple[float, float]]:
+    def get_xy(i: int):
         return pose.xy.get(i) if pose and i in pose.xy else None
 
-    shoulderL = get_xy(11)
-    shoulderR = get_xy(12)
-    hipL = get_xy(23)
-    hipR = get_xy(24)
+    shoulderL, shoulderR = get_xy(11), get_xy(12)
+    hipL, hipR = get_xy(23), get_xy(24)
 
     if shoulderL and shoulderR and hipL and hipR:
         y_sh = (shoulderL[1] + shoulderR[1]) / 2.0
         y_hp = (hipL[1] + hipR[1]) / 2.0
         x_center = (hipL[0] + hipR[0]) / 2.0
     else:
-        # fallback: use mask bbox
         ys, xs = np.where(mask01 > 0)
         if ys.size == 0:
             return MeasurementResult(
-                px_per_cm=px_per_cm,
-                rotation_deg=rotation_deg,
-                garment_class=garment_class,
-                material=material,
-                offset_per_side_cm=0.0,
-                width_deduct_cm=0.0,
-                shoulder_width_cm=None,
-                chest_circ_cm=None,
-                waist_circ_cm=None,
-                hip_circ_cm=None,
-                arm_len_cm=None,
-                leg_len_cm=None,
+                px_per_cm=px_per_cm, rotation_deg=rotation_deg,
+                garment_class=garment_class, material=material,
+                offset_per_side_cm=0.0, width_deduct_cm=0.0,
+                shoulder_width_cm=None, chest_circ_cm=None, waist_circ_cm=None, hip_circ_cm=None,
+                arm_len_cm=None, leg_len_cm=None,
                 debug={"reason": "empty_mask"},
             )
         y_sh = float(np.percentile(ys, 20))
@@ -567,10 +529,9 @@ def compute_measurements(
     y_chest = y_sh + 0.28 * (y_hp - y_sh)
     y_waist = y_sh + 0.55 * (y_hp - y_sh)
     y_hip = y_sh + 0.82 * (y_hp - y_sh)
-
     debug["y_levels_px"] = {"shoulder": y_sh, "chest": y_chest, "waist": y_waist, "hip": y_hip}
 
-    # Shoulder width using boundary scan from shoulder joints (reduces arm contamination)
+    # Shoulder width: 관절 주변에서 바깥 경계까지 스캔
     shoulder_width_px = None
     if shoulderL and shoulderR:
         yS = _safe_int(y_sh, 0, h - 1)
@@ -582,12 +543,13 @@ def compute_measurements(
             shoulder_width_px = right_edge - left_edge + 1
             debug["shoulder_edges_px"] = {"y": yS, "left": left_edge, "right": right_edge}
 
-    # Looseness proxy: clothed chest width / (pose shoulder joint span)
+    # looseness = clothed chest width / pose shoulder span (proxy)
     looseness = 1.25
     pose_shoulder_span_cm = None
     if shoulderL and shoulderR:
         pose_span_px = float(abs(shoulderR[0] - shoulderL[0]))
         pose_shoulder_span_cm = pose_span_px / px_per_cm
+
     chest_run = center_run_width(mask01, _safe_int(y_chest, 0, h - 1), _safe_int(x_center, 0, w - 1))
     if chest_run is not None and pose_shoulder_span_cm and pose_shoulder_span_cm > 1e-6:
         _, _, chest_w_px = chest_run
@@ -596,14 +558,11 @@ def compute_measurements(
     debug["looseness"] = looseness
     debug["pose_shoulder_span_cm"] = pose_shoulder_span_cm
 
-    # Offset estimation
     offset_per_side_cm = estimate_offset_per_side_cm(garment_class, material, looseness, mode=offset_mode)
     width_deduct_cm = 2.0 * offset_per_side_cm
 
-    # Optional erosion (more “physics-y” demo)
     mask_use = maybe_erode_mask(mask01, offset_per_side_cm, px_per_cm, enabled=erosion_enabled)
 
-    # Width sampling (after erosion if enabled)
     def width_cm_at(yf: float) -> Optional[float]:
         y = _safe_int(yf, 0, h - 1)
         cx = _safe_int(x_center, 0, w - 1)
@@ -616,24 +575,20 @@ def compute_measurements(
     chest_width_cm = width_cm_at(y_chest)
     waist_width_cm = width_cm_at(y_waist)
     hip_width_cm = width_cm_at(y_hip)
-
     debug["widths_cm_post_erosion"] = {
         "chest_width_cm": chest_width_cm,
         "waist_width_cm": waist_width_cm,
         "hip_width_cm": hip_width_cm,
     }
 
-    # Shoulder width (use non-eroded for stability, then deduct)
     shoulder_width_cm = None
     if shoulder_width_px is not None:
         shoulder_width_cm = float(shoulder_width_px / px_per_cm)
 
-    # Apply width deduct (if not using erosion, this is the main correction)
     def corrected_width(width_cm: Optional[float]) -> Optional[float]:
         if width_cm is None:
             return None
         if erosion_enabled:
-            # erosion already baked in; small residual deduct only
             return float(max(0.0, width_cm))
         return float(max(0.0, width_cm - width_deduct_cm))
 
@@ -645,17 +600,12 @@ def compute_measurements(
     if shoulder_width_cm is not None:
         shoulder_w_body = float(max(0.0, shoulder_width_cm - (0.5 * width_deduct_cm)))
 
-    # Ratio: fixed MVP (option hook for learnable later)
     ratios = DEFAULT_RATIOS.copy()
 
-    # small rotation compensation (demo only)
-    rot_factor = 1.0 + (abs(rotation_deg) / 90.0) * 0.04  # up to ~+1.3%
-    # looseness compensation: if very loose, circumference ratio goes up slightly
+    rot_factor = 1.0 + (abs(rotation_deg) / 90.0) * 0.04
     loose_factor = 1.0 + max(0.0, looseness - 1.3) * 0.03
 
-    if ratio_mode == "fixed":
-        pass
-    elif ratio_mode == "fixed+signals":
+    if ratio_mode == "fixed+signals":
         ratios["chest"] *= rot_factor * loose_factor
         ratios["waist"] *= (1.0 + max(0.0, looseness - 1.3) * 0.02)
         ratios["hip"] *= (1.0 + max(0.0, looseness - 1.3) * 0.02)
@@ -664,12 +614,10 @@ def compute_measurements(
     debug["rot_factor"] = rot_factor
     debug["loose_factor"] = loose_factor
 
-    # Circumference estimates
     chest_circ = None if chest_w_body is None else float(chest_w_body * ratios["chest"])
     waist_circ = None if waist_w_body is None else float(waist_w_body * ratios["waist"])
     hip_circ = None if hip_w_body is None else float(hip_w_body * ratios["hip"])
 
-    # Pose lengths
     arm_len_cm, leg_len_cm = (None, None)
     if pose:
         arm_len_cm, leg_len_cm = measure_lengths_from_pose(pose, px_per_cm)
@@ -698,11 +646,7 @@ st.title("FormFoundry AI — A4 Calibrated Measurement MVP")
 
 with st.sidebar:
     st.header("Mode")
-    mode = st.radio(
-        "측정 모드",
-        ["고정밀 (A4 마커 필수)", "대체 (A4 없이: 대략)"],
-        index=0,
-    )
+    mode = st.radio("측정 모드", ["고정밀 (A4 마커 필수)", "대체 (A4 없이: 대략)"], index=0)
 
     st.header("A4 Calibration")
     px_per_mm = st.slider("A4 워프 해상도 (px/mm)", min_value=3.0, max_value=10.0, value=6.0, step=0.5)
@@ -732,41 +676,45 @@ with st.sidebar:
     st.header("Export")
     export_json = st.checkbox("결과 JSON 출력", value=True)
 
-    # Offer marker sheet download if present on server
-    marker_pdf_path = "/mnt/data/FormFoundry_A4_MarkerSheet_v1_1.pdf"
-    try:
-        with open(marker_pdf_path, "rb") as f:
-            pdf_bytes = f.read()
+    # Marker sheet download (repo relative assets)
+    if MARKER_PDF.exists():
         st.download_button(
             "A4 마커 시트 PDF 다운로드",
-            data=pdf_bytes,
-            file_name="FormFoundry_A4_MarkerSheet_v1_1.pdf",
+            data=MARKER_PDF.read_bytes(),
+            file_name=MARKER_PDF.name,
             mime="application/pdf",
         )
-    except Exception:
-        pass
+    else:
+        st.caption("assets 폴더에 마커 PDF가 없으면 다운로드 버튼이 숨겨집니다.")
 
 
 colL, colR = st.columns([1.1, 0.9])
 
 with colL:
     st.subheader("Input")
-    uploaded = st.file_uploader("전신 사진 업로드 (A4 마커 포함 권장)", type=["jpg", "jpeg", "png", "webp"])
-    use_camera = st.checkbox("카메라로 촬영 (가능하면)", value=False)
-    camera_img = None
-    if use_camera:
-        camera_img = st.camera_input("Capture")
 
-    if cv2 is None:
-        st.error("OpenCV unavailable.")
-        st.stop()
+    # Demo button (repo relative)
+    demo_path = next((p for p in DEMO_IMAGE_CANDIDATES if p.exists()), None)
+    use_demo = False
+    if demo_path is not None:
+        use_demo = st.button("Demo 이미지로 테스트 (assets/demo_front.*)")
 
-    if uploaded is None and camera_img is None:
+    uploaded = None if use_demo else st.file_uploader("전신 사진 업로드 (A4 마커 포함 권장)", type=["jpg", "jpeg", "png", "webp"])
+    use_camera = False if use_demo else st.checkbox("카메라로 촬영 (가능하면)", value=False)
+    camera_img = st.camera_input("Capture") if use_camera else None
+
+    _require_cv2()
+
+    if not use_demo and uploaded is None and camera_img is None:
         st.info("이미지를 업로드하거나 카메라 촬영을 해주세요.")
         st.stop()
 
     try:
-        if camera_img is not None:
+        if use_demo:
+            img_bgr = cv2.imread(str(demo_path), cv2.IMREAD_COLOR)
+            if img_bgr is None:
+                raise ValueError("demo image read failed")
+        elif camera_img is not None:
             img_bgr = _read_image(camera_img)
         else:
             img_bgr = _read_image(uploaded)
@@ -774,11 +722,13 @@ with colL:
         st.error(f"이미지 로드 실패: {e}")
         st.stop()
 
-    st.image(_to_rgb(img_bgr), caption="Original", width="stretch")
+    st_image_compat(_to_rgb(img_bgr), caption="Original")
 
 
 # --- Calibration ---
 calib = None
+px_per_cm = 14.0  # fallback init
+
 if mode.startswith("고정밀"):
     calib = detect_a4_calibration(img_bgr, px_per_mm=px_per_mm, dict_name=MARKER_DICT_NAME)
     if not calib.ok:
@@ -789,26 +739,22 @@ if mode.startswith("고정밀"):
         st.stop()
 
     warped_bgr = warp_to_a4(img_bgr, calib)
+    px_per_cm = float(px_per_mm * 10.0)
+
     with colR:
         st.subheader("A4 Rectified")
-        st.image(_to_rgb(warped_bgr), caption="Warped to A4 plane", width="stretch")
+        st_image_compat(_to_rgb(warped_bgr), caption="Warped to A4 plane")
         st.caption(f"px/mm = {calib.px_per_mm:.2f}  |  A4(px) = {calib.a4_size_px}")
-
-    px_per_cm = float(px_per_mm * 10.0)
 else:
-    calib = None
-    # crude fallback: ask height to estimate px/cm from pose later; if no pose, no scale.
     with colR:
         st.subheader("Fallback Mode")
         height_cm = st.number_input("키 입력(cm) — A4 없을 때만", min_value=120.0, max_value=220.0, value=175.0, step=0.5)
-    # temporary default; later refined if pose is available
-    px_per_cm = 14.0  # placeholder; will be overwritten if pose-based scale is computed
 
 
 # --- Pose ---
 pose = infer_pose_landmarks(img_bgr, calib if mode.startswith("고정밀") else None)
 if pose is None:
-    st.warning("Pose 추론 실패(또는 mediapipe 미설치). 측정 일부가 제한될 수 있습니다.")
+    st.warning("Pose 추론 실패(또는 mediapipe 미설치). 일부 출력(팔/다리/회전)이 제한될 수 있습니다.")
 
 # --- Segmentation ---
 mask01 = infer_person_mask_yolo(img_bgr, conf=yolo_conf)
@@ -818,15 +764,13 @@ if mask01 is None:
 
 # Warp mask if calibrated
 if mode.startswith("고정밀") and calib and calib.ok:
-    mask_a4 = warp_mask_to_a4(mask01, calib)
-    work_mask = mask_a4
+    work_mask = warp_mask_to_a4(mask01, calib)
 else:
     work_mask = mask01
 
-# If fallback mode, estimate px_per_cm from pose + height (very rough)
+# Fallback px_per_cm: pose + height
 if not mode.startswith("고정밀"):
-    if pose and mp is not None:
-        # Estimate pixel height: nose(0) to ankles(27/28) or heel(29/30) fallback
+    if pose is not None:
         def get(i): return pose.xy.get(i) if pose and i in pose.xy else None
         top = get(0) or get(11) or get(12)
         aL = get(27) or get(29)
@@ -835,13 +779,12 @@ if not mode.startswith("고정밀"):
             y_top = top[1]
             y_bot = max(aL[1], aR[1])
             pix_h = max(1.0, y_bot - y_top)
-            px_per_cm = float(pix_h / height_cm)
+            px_per_cm = float(pix_h / float(height_cm))
 
-# Overlay preview
 with colR:
     st.subheader("Mask Preview")
     vis = np.dstack([work_mask * 255, work_mask * 255, work_mask * 255]).astype(np.uint8)
-    st.image(vis, caption="Person mask (working plane)", width="stretch")
+    st_image_compat(vis, caption="Person mask (working plane)")
     st.caption(f"px/cm = {px_per_cm:.2f}")
 
 # --- Measurements ---
@@ -860,7 +803,6 @@ result = compute_measurements(
 # Output
 # =========================
 st.subheader("Module Summary (시연용)")
-
 rot_txt = f"{result.rotation_deg:.1f}° rotation"
 offset_txt = f"Width deduct: -{result.width_deduct_cm:.1f} cm"
 thick_txt = f"offset(per-side): {result.offset_per_side_cm:.2f} cm"
@@ -889,24 +831,27 @@ st.subheader("Body Specs (Output)")
 def fmt(v: Optional[float]) -> str:
     return "-" if v is None else f"{v:.1f} cm"
 
-out_cols = st.columns(2)
-with out_cols[0]:
+c1, c2 = st.columns(2)
+with c1:
     st.metric("Shoulder Width", fmt(result.shoulder_width_cm))
     st.metric("Chest Circumference", fmt(result.chest_circ_cm))
     st.metric("Waist Circumference", fmt(result.waist_circ_cm))
-with out_cols[1]:
+with c2:
     st.metric("Hip Circumference", fmt(result.hip_circ_cm))
     st.metric("Arm Length", fmt(result.arm_len_cm))
     st.metric("Leg Length", fmt(result.leg_len_cm))
 
 st.subheader("계산 로직(짧게)")
-logic_lines = [
-    f"- 스케일(px/cm): {result.px_per_cm:.2f}",
-    "- 고정밀 모드: A4 마커를 Homography로 A4 평면에 정렬 → 같은 좌표계에서 Pose/Mask를 측정",
-    "- chest/waist/hip: 마스크에서 해당 y 라인의 center-run 폭(px) → cm 변환 → ratio로 둘레 추정",
-    "- volume-offset: garment class + material + looseness로 per-side 두께(cm) 추정 → 폭에서 2배 차감 또는 erosion",
-]
-st.write("\n".join(logic_lines))
+st.write(
+    "\n".join(
+        [
+            f"- 스케일(px/cm): {result.px_per_cm:.2f}",
+            "- 고정밀 모드: A4 마커를 Homography로 A4 평면에 정렬 → 동일 좌표계에서 Pose/Mask 측정",
+            "- chest/waist/hip: 마스크 y 라인의 center-run 폭(px) → cm 변환 → ratio로 둘레 추정",
+            "- volume-offset: garment class + material + looseness로 per-side 두께(cm) 추정 → 폭에서 2배 차감 또는 erosion",
+        ]
+    )
+)
 
 if export_json:
     st.subheader("Export JSON")
