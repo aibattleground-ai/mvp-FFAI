@@ -406,12 +406,22 @@ def detect_a4_calibration(img_bgr: np.ndarray, px_per_mm: float, dict_name: str)
     # 4) build correspondences
     img_pts, obj_pts = [], []
 
+    marker_side_pxs = []  # marker side length in pixels (for px/mm estimate)
+
     side_pxs = []  # marker side length in image pixels
     for c, mid in zip(corners, ids.flatten()):
         mid = int(mid)
         if mid not in MARKER_IDS_REQUIRED:
             continue
-        c2 = c.reshape(-1, 2).astype(np.float32)  # tl,tr,br,bl in *upscaled* coords
+        c2 = c.reshape(-1, 2).astype(np.float32)      # tl,tr,br,bl
+        # estimate px/mm at marker plane from marker side length
+        side_px = (
+            float(np.linalg.norm(c2[0] - c2[1])) +
+            float(np.linalg.norm(c2[1] - c2[2])) +
+            float(np.linalg.norm(c2[2] - c2[3])) +
+            float(np.linalg.norm(c2[3] - c2[0]))
+        ) / 4.0
+        marker_side_pxs.append(side_px)
         # average marker side length (px) for scale estimation
         lens = [float(np.linalg.norm(c2[(i+1)%4] - c2[i])) for i in range(4)]
         side_pxs.append(float(np.mean(lens)))
@@ -438,6 +448,11 @@ def detect_a4_calibration(img_bgr: np.ndarray, px_per_mm: float, dict_name: str)
     a4_w_px = int(round(A4_W_MM * px_per_mm))
     a4_h_px = int(round(A4_H_MM * px_per_mm))
 
+    px_per_mm_est = None
+    if marker_side_pxs:
+        px_per_mm_est = float(np.mean(marker_side_pxs) / float(MARKER_SIDE_MM))
+
+
     return A4Calib(
         ok=True,
         H_img2mm=H_img2mm,
@@ -447,7 +462,7 @@ def detect_a4_calibration(img_bgr: np.ndarray, px_per_mm: float, dict_name: str)
         a4_size_px=(a4_w_px, a4_h_px),
         debug={
             "markers_found": ids_list,
-            "px_per_mm": px_per_mm,
+            "px_per_mm": px_per_mm, "px_per_mm_est": px_per_mm_est,
             "a4_size_px": (a4_w_px, a4_h_px),
             "used_dict": used_dn,
             "tried": tried,
@@ -935,7 +950,7 @@ if mode.startswith("고정밀"):
     if getattr(calib, 'px_per_mm_img', None):
         px_per_cm = float(calib.px_per_mm_img * 10.0)
     else:
-        px_per_cm = float(px_per_mm * 10.0)
+        px_per_cm = float(((calib.debug.get("px_per_mm_est") or px_per_mm) * 10.0))
 
     with colR:
         st.subheader("A4 Rectified")
