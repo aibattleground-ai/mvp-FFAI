@@ -113,6 +113,7 @@ class A4Calib:
     H_img2mm: Optional[np.ndarray] = None
     H_img2px: Optional[np.ndarray] = None
     px_per_mm: Optional[float] = None
+    px_per_mm_img: Optional[float] = None  # derived from marker pixels in the photo
     a4_size_px: Optional[Tuple[int, int]] = None
     debug: Optional[dict] = None
 
@@ -375,11 +376,16 @@ def detect_a4_calibration(img_bgr: np.ndarray, px_per_mm: float, dict_name: str)
 
     # 4) build correspondences
     img_pts, obj_pts = [], []
+
+    side_pxs = []  # marker side length in image pixels
     for c, mid in zip(corners, ids.flatten()):
         mid = int(mid)
         if mid not in MARKER_IDS_REQUIRED:
             continue
         c2 = c.reshape(-1, 2).astype(np.float32)  # tl,tr,br,bl in *upscaled* coords
+        # average marker side length (px) for scale estimation
+        lens = [float(np.linalg.norm(c2[(i+1)%4] - c2[i])) for i in range(4)]
+        side_pxs.append(float(np.mean(lens)))
         c2 = (c2 / scale).astype(np.float32)      # scale back to original image coords
         obj = _marker_object_corners_mm(mid)      # tl,tr,br,bl (mm)
         img_pts.append(c2)
@@ -387,6 +393,10 @@ def detect_a4_calibration(img_bgr: np.ndarray, px_per_mm: float, dict_name: str)
 
     img_pts = np.vstack(img_pts).astype(np.float32)
     obj_pts = np.vstack(obj_pts).astype(np.float32)
+
+    px_per_mm_img = None
+    if side_pxs:
+        px_per_mm_img = float(np.mean(side_pxs) / float(MARKER_SIDE_MM))
 
     H_img2mm, inliers = cv2.findHomography(img_pts, obj_pts, method=cv2.RANSAC, ransacReprojThreshold=4.0)
     if H_img2mm is None:
@@ -404,6 +414,7 @@ def detect_a4_calibration(img_bgr: np.ndarray, px_per_mm: float, dict_name: str)
         H_img2mm=H_img2mm,
         H_img2px=H_img2px,
         px_per_mm=px_per_mm,
+        px_per_mm_img=px_per_mm_img,
         a4_size_px=(a4_w_px, a4_h_px),
         debug={
             "markers_found": ids_list,
@@ -891,7 +902,11 @@ if mode.startswith("고정밀"):
         st.stop()
 
     warped_bgr = warp_to_a4(img_bgr, calib)
-    px_per_cm = float(px_per_mm * 10.0)
+    # measurement scale from observed marker size in the original photo
+    if getattr(calib, 'px_per_mm_img', None):
+        px_per_cm = float(calib.px_per_mm_img * 10.0)
+    else:
+        px_per_cm = float(px_per_mm * 10.0)
 
     with colR:
         st.subheader("A4 Rectified")
@@ -914,11 +929,10 @@ if mask01 is None:
     st.error("인물 마스크 추론 실패. (YOLO/seg 모델 또는 person 검출 문제)")
     st.stop()
 
-# Warp mask if calibrated
-if mode.startswith("고정밀") and calib and calib.ok:
-    work_mask = warp_mask_to_a4(mask01, calib)
-else:
-    work_mask = mask01
+# Working plane for measurements:
+# In real photos the A4 marker is often held in hand (different plane than the whole body),
+# so warping the whole mask onto the A4 plane can crop the person. Measure on original mask.
+work_mask = mask01
 
 # Fallback px_per_cm: height scaling (pose preferred, mask bbox fallback)
 if not mode.startswith("고정밀"):
