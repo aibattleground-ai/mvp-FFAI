@@ -828,7 +828,14 @@ with colR:
     st.subheader("Mask Preview")
     vis = np.dstack([work_mask * 255, work_mask * 255, work_mask * 255]).astype(np.uint8)
     st_image_compat(vis, caption="Person mask (working plane)")
-    st.caption(f"px/cm = {px_per_cm:.2f}")
+        # --- Sanity check for fallback scale ---
+    if mode.startswith("대체"):
+        # 대체모드는 키/마스크 기반 스케일 추정이라 입력에 따라 쉽게 무너짐
+        if (px_per_cm < 5.0) or (px_per_cm > 30.0):
+            st.error(f"대체 모드 스케일 추정 실패(px/cm={px_per_cm:.2f}). 전신이 더 크게 나오게 촬영하거나, 배경 대비가 잘 보이는 사진을 사용하세요.\n실측 데모는 고정밀(A4 마커) 모드로 진행합니다.")
+            st.stop()
+
+st.caption(f"px/cm = {px_per_cm:.2f}")
 
 # --- Measurements ---
 result = compute_measurements(
