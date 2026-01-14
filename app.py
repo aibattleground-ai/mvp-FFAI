@@ -48,6 +48,8 @@ A4_H_MM = 297.0
 
 # Marker sheet design assumptions (your PDF preview 기준)
 MARKER_DICT_NAME = "DICT_4X4_50"
+
+MARKER_DICT_CANDIDATES = ["DICT_4X4_50", "DICT_4X4_100", "DICT_4X4_250", "DICT_4X4_1000"]
 MARKER_IDS_REQUIRED = {0, 1, 2, 3}
 MARKER_SIDE_MM = 45.0
 MARGIN_MM = 10.0
@@ -252,15 +254,34 @@ def _marker_object_corners_mm(marker_id: int) -> np.ndarray:
 def detect_a4_calibration(img_bgr: np.ndarray, px_per_mm: float, dict_name: str) -> A4Calib:
     _require_cv2()
 
-    corners, ids, _rej = _aruco_detect_markers(img_bgr, dict_name=dict_name)
-    if ids is None or len(ids) == 0:
-        return A4Calib(ok=False, debug={"reason": "no_markers"})
+        # 여러 dict를 시도해서 required id(0,1,2,3)를 가장 잘 잡는 dict 선택
+    best = None  # (found_count, corners, ids, used_dict)
+    for dn in MARKER_DICT_CANDIDATES:
+        try:
+            corners, ids, _rej = _aruco_detect_markers(img_bgr, dict_name=dn)
+        except Exception:
+            continue
+        if ids is None or len(ids) == 0:
+            continue
+        ids_list_tmp = [int(i) for i in ids.flatten().tolist()]
+        found_tmp = set(ids_list_tmp)
+        found_count = len(MARKER_IDS_REQUIRED & found_tmp)
+        if best is None or found_count > best[0]:
+            best = (found_count, corners, ids, dn)
+        if found_count == len(MARKER_IDS_REQUIRED):
+            break
+
+    if best is None:
+        return A4Calib(ok=False, debug={"reason": "no_markers", "tried": MARKER_DICT_CANDIDATES})
+
+    found_count, corners, ids, used_dict = best
+
 
     ids_list = [int(i) for i in ids.flatten().tolist()]
     found = set(ids_list)
     missing = list(MARKER_IDS_REQUIRED - found)
     if missing:
-        return A4Calib(ok=False, debug={"reason": "missing_markers", "missing": missing, "found": ids_list})
+        return A4Calib(ok=False, debug={"reason": "missing_markers", "missing": missing, "found": ids_list, "dict": used_dict})
 
     img_pts, obj_pts = [], []
     for c, mid in zip(corners, ids.flatten()):
