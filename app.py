@@ -825,7 +825,6 @@ if not mode.startswith("고정밀"):
             px_per_cm = float(pix_h / float(height_cm))
 
 with colR:
-with colR:
     st.subheader("Mask Preview")
     vis = np.dstack([work_mask * 255, work_mask * 255, work_mask * 255]).astype(np.uint8)
     st_image_compat(vis, caption="Person mask (working plane)")
