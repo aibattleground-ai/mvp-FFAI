@@ -1,10 +1,11 @@
-import os
-os.environ["YOLO_CONFIG_DIR"] = "/tmp/Ultralytics"
 # app.py
 # FormFoundry AI — A4 Marker (PnP/Homography) Calibrated Measurement MVP
 # 안정화 패치 포함: ArUco(OpenCV) 호환, assets 상대경로, Streamlit image width 호환
 
 from __future__ import annotations
+import os
+os.environ["YOLO_CONFIG_DIR"] = "/tmp/Ultralytics"
+
 
 import json
 import math
