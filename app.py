@@ -62,7 +62,7 @@ GARMENT_PRIORS_CM_PER_SIDE = {
     "coat": (1.2, 2.5),
     "puffer": (2.0, 4.0),
 }
-MARKER_PDF_PATH = Path(__file__).resolve().parent / "main" / "assets" / "FormFoundry_A4_MarkerSheet_v1_1.pdf"
+MARKER_PDF_PATH = Path(__file__).resolve().parent / "assets" / "FormFoundry_A4_MarkerSheet_v1_1.pdf"
 
 # --- Preflight: required asset check ---
 import streamlit as st
