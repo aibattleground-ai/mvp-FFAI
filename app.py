@@ -845,6 +845,7 @@ st.title("FormFoundry AI — A4 Calibrated Measurement MVP")
 with st.sidebar:
     st.header("Mode")
     mode = st.radio("측정 모드", ["고정밀 (A4 마커 필수)", "대체 (A4 없이: 대략)"], index=0)
+    user_height_cm = st.number_input("키(cm)", min_value=120.0, max_value=220.0, value=175.0, step=0.5, help="A4/대체 모드 모두에서 스케일 안정화를 위해 사용됩니다.")
 
     st.header("A4 Calibration")
     px_per_mm = st.slider("A4 워프 해상도 (px/mm)", min_value=3.0, max_value=10.0, value=6.0, step=0.5)
@@ -960,9 +961,7 @@ if mode.startswith("고정밀"):
 else:
     with colR:
         st.subheader("Fallback Mode")
-        height_cm = st.number_input("키 입력(cm) — A4 없을 때만", min_value=120.0, max_value=220.0, value=175.0, step=0.5)
-
-
+        height_cm = float(user_height_cm)
 # --- Pose ---
 pose = infer_pose_landmarks(img_bgr, calib if mode.startswith("고정밀") else None)
 if pose is None:
@@ -1021,19 +1020,33 @@ st.caption(f"px/cm = {px_per_cm:.2f}")
 
 
 # --- Measurements ---
-# 고정밀(A4)에서는 `detect_a4_calibration()`에서 이미 '원본 사진에서의 A4 스케일'로 px/cm를 산출해 둔다.
-# (YOLO 마스크는 위에서 원본 해상도로 리사이즈했으므로, px/cm와 좌표계가 일치한다.)
-if calib is not None and getattr(calib, 'px_per_mm_img', None):
+# 고정밀(A4)에서는 marker 기반 px/cm를 사용하되,
+# A4가 인체와 다른 평면(손에 들고 뻗은 경우 등)이면 키 기반(px/cm)로 데모 안정화합니다.
+if mode.startswith("고정밀") and calib is not None:
+    px_per_mm_img, a4_h_px = _calib_px_per_mm_img(calib)
+
+    px_per_cm_marker = float(px_per_mm_img * 10.0) if (px_per_mm_img is not None) else None
+
     ys, xs = np.where(work_mask > 0)
-    if ys.size > 0:
-        person_h_px = float(ys.max() - ys.min() + 1)
-        a4_h_px = float(calib.px_per_mm_img * 297.0)
-        ratio = float(a4_h_px / max(1.0, person_h_px))
+    person_h_px = float(ys.max() - ys.min() + 1) if ys.size > 0 else None
+    px_per_cm_height = float(person_h_px / float(user_height_cm)) if (person_h_px is not None) else None
+
+    # 기본: marker
+    if px_per_cm_marker is not None:
+        px_per_cm = float(px_per_cm_marker)
+
+    # A4/키 픽셀비 sanity check → 비정상이면 height로 override
+    if (a4_h_px is not None) and (person_h_px is not None) and (px_per_cm_height is not None):
+        ratio = float(a4_h_px / max(1.0, float(person_h_px)))  # (A4높이px / 사람키px)
         if ratio < 0.08 or ratio > 0.35:
             st.warning(
-                f"A4-인체 거리 불일치 가능성: A4가 사람 대비 너무 {'작' if ratio < 0.08 else '큽'}니다 (A4/키 픽셀비={ratio:.2f}). "
-                "A4를 몸에 밀착(가슴/복부)시키고 팔을 뻗지 말고, 전신이 프레임에 들어오게 다시 촬영하세요."
+                f"A4-인체 평면 불일치로 스케일이 붕괴할 수 있습니다 (A4/키 픽셀비={ratio:.2f}). "
+                "데모 안정화를 위해 키 기반(px/cm)을 사용합니다."
             )
+            px_per_cm = float(px_per_cm_height)
+    elif (px_per_cm_marker is None) and (px_per_cm_height is not None):
+        st.warning("A4 스케일 추정 실패 → 키 기반(px/cm)로 대체했습니다. (데모 안정화)")
+        px_per_cm = float(px_per_cm_height)
 
 result = compute_measurements(
     mask01=work_mask,
