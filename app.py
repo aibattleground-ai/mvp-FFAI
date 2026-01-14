@@ -656,6 +656,48 @@ def maybe_erode_mask(mask01: np.ndarray, offset_per_side_cm: float, px_per_cm: f
     return (eroded > 0).astype(np.uint8)
 
 
+
+
+def infer_pose_landmarks_with_mask(img_bgr: np.ndarray, mask01: np.ndarray) -> Optional[PoseLandmarks]:
+    """Fallback: YOLO person mask bbox로 인물을 크게 크롭해서 BlazePose 안정성 향상."""
+    if mp is None:
+        return None
+    model = _get_pose_model()
+    if model is None:
+        return None
+    try:
+        ys, xs = np.where(mask01 > 0)
+        if ys.size == 0:
+            return None
+
+        y0, y1 = int(ys.min()), int(ys.max())
+        x0, x1 = int(xs.min()), int(xs.max())
+        H, W = img_bgr.shape[:2]
+
+        # pad bbox (12%)
+        pad = int(0.12 * max(y1 - y0 + 1, x1 - x0 + 1))
+        x0 = max(0, x0 - pad); y0 = max(0, y0 - pad)
+        x1 = min(W - 1, x1 + pad); y1 = min(H - 1, y1 + pad)
+
+        crop_bgr = img_bgr[y0:y1+1, x0:x1+1]
+        crop_rgb = _to_rgb(crop_bgr)
+
+        res = model.process(crop_rgb)
+        if res is None or res.pose_landmarks is None:
+            return None
+
+        ch, cw = crop_rgb.shape[:2]
+        xy, zz = {}, {}
+        for i, lm in enumerate(res.pose_landmarks.landmark):
+            px = x0 + float(lm.x) * float(cw)
+            py = y0 + float(lm.y) * float(ch)
+            xy[i] = (px, py)
+            zz[i] = float(lm.z)
+
+        return PoseLandmarks(xy=xy, z=zz)
+    except Exception:
+        return None
+
 def measure_lengths_from_pose(pose: PoseLandmarks, px_per_cm: float):
     def dist(a: int, b: int) -> Optional[float]:
         if a not in pose.xy or b not in pose.xy:
@@ -964,14 +1006,22 @@ else:
         height_cm = float(user_height_cm)
 # --- Pose ---
 pose = infer_pose_landmarks(img_bgr, calib if mode.startswith("고정밀") else None)
-if pose is None:
-    st.warning("Pose 추론 실패(또는 mediapipe 미설치). 일부 출력(팔/다리/회전)이 제한될 수 있습니다.")
+_pose_first_failed = (pose is None)
 
 # --- Segmentation ---
 mask01 = infer_person_mask_yolo(img_bgr, conf=yolo_conf)
 if mask01 is None:
     st.error("인물 마스크 추론 실패. (YOLO/seg 모델 또는 person 검출 문제)")
     st.stop()
+
+# Pose fallback (after we have YOLO mask)
+if pose is None and mask01 is not None:
+    pose = infer_pose_landmarks_with_mask(img_bgr, mask01)
+
+if pose is None:
+    st.warning("Pose 추론 실패(또는 mediapipe 미설치). 일부 출력(팔/다리/회전)이 제한될 수 있습니다.")
+elif '_pose_first_failed' in globals() and _pose_first_failed:
+    st.caption("Pose: mask-crop fallback으로 복구했습니다.")
 
 # Ensure YOLO mask is aligned to the original image resolution (YOLO may output in resized space)
 h_img, w_img = img_bgr.shape[:2]
