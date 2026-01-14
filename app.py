@@ -861,6 +861,9 @@ summary_lines = [
 ]
 st.code("\n".join(summary_lines), language="text")
 
+if mode.startswith("대체"):
+    st.warning("대체 모드(=A4 없음)는 스케일 추정이 불안정합니다. 이 화면의 수치는 '대략'이며, 실제 cm 정확도 데모는 '고정밀(A4 마커 필수)' 모드로 진행하세요.")
+
 st.subheader("Body Specs (Output)")
 
 def fmt(v: Optional[float]) -> str:
