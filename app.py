@@ -312,18 +312,22 @@ def warp_mask_to_a4(mask01: np.ndarray, calib: A4Calib) -> np.ndarray:
 # =========================
 @st.cache_resource
 def _get_pose_model():
+    # Pose는 MVP에서 '옵셔널'이므로, 어떤 환경에서도 앱을 죽이지 않게 방어
     if mp is None:
         return None
-    Pose = mp.solutions.pose.Pose
-    return Pose(
-        static_image_mode=True,
-        model_complexity=1,
-        enable_segmentation=False,
-        min_detection_confidence=0.5,
-    )
+    try:
+        if (not hasattr(mp, 'solutions')) or (not hasattr(mp.solutions, 'pose')):
+            return None
+        Pose = mp.solutions.pose.Pose
+        return Pose(
+            static_image_mode=True,
+            model_complexity=1,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+        )
+    except Exception:
+        return None
 
-
-def infer_pose_landmarks(img_bgr: np.ndarray, calib: Optional[A4Calib]) -> Optional[PoseLandmarks]:
     if mp is None:
         return None
     model = _get_pose_model()
