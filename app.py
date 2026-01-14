@@ -425,7 +425,8 @@ def detect_a4_calibration(img_bgr: np.ndarray, px_per_mm: float, dict_name: str)
         # average marker side length (px) for scale estimation
         lens = [float(np.linalg.norm(c2[(i+1)%4] - c2[i])) for i in range(4)]
         side_pxs.append(float(np.mean(lens)))
-        c2 = (c2 / scale).astype(np.float32)      # scale back to original image coords
+        # corners are already scaled back to original-image coords by the detector; keep as-is
+        c2 = c2.astype(np.float32)
         obj = _marker_object_corners_mm(mid)      # tl,tr,br,bl (mm)
         img_pts.append(c2)
         obj_pts.append(obj)
@@ -973,6 +974,12 @@ if mask01 is None:
     st.error("인물 마스크 추론 실패. (YOLO/seg 모델 또는 person 검출 문제)")
     st.stop()
 
+# Ensure YOLO mask is aligned to the original image resolution (YOLO may output in resized space)
+h_img, w_img = img_bgr.shape[:2]
+if mask01.shape[:2] != (h_img, w_img):
+    mask01 = cv2.resize(mask01.astype(np.uint8), (w_img, h_img), interpolation=cv2.INTER_NEAREST)
+    mask01 = (mask01 > 0).astype(np.uint8)
+
 # Working plane for measurements:
 # In real photos the A4 marker is often held in hand (different plane than the whole body),
 # so warping the whole mask onto the A4 plane can crop the person. Measure on original mask.
@@ -1014,21 +1021,19 @@ st.caption(f"px/cm = {px_per_cm:.2f}")
 
 
 # --- Measurements ---
-# 고정밀(A4)에서는 px/cm를 '워프 해상도'가 아니라 '원본 이미지에서의 A4 스케일'로 잡는다.
-if calib is not None:
-    px_per_mm_img, a4_h_px = _calib_px_per_mm_img(calib)
-    if px_per_mm_img is not None:
-        # A4가 사람과 같은 거리(대략)인지 sanity check
-        ys, xs = np.where(work_mask > 0)
-        if ys.size > 0 and a4_h_px is not None:
-            person_h_px = float(ys.max() - ys.min() + 1)
-            ratio = float(a4_h_px / max(1.0, person_h_px))  # (A4높이px / 사람키px)
-            if ratio < 0.08 or ratio > 0.35:
-                st.warning(
-                    f"A4-인체 거리 불일치 가능성: A4가 사람 대비 너무 {'작' if ratio < 0.08 else '큽'}니다 (A4/키 픽셀비={ratio:.2f}). "
-                    "A4를 몸에 밀착(가슴/복부)시키고 팔을 뻗지 말고, 전신이 프레임에 들어오게 다시 촬영하세요."
-                )
-        px_per_cm = float(px_per_mm_img * 10.0)
+# 고정밀(A4)에서는 `detect_a4_calibration()`에서 이미 '원본 사진에서의 A4 스케일'로 px/cm를 산출해 둔다.
+# (YOLO 마스크는 위에서 원본 해상도로 리사이즈했으므로, px/cm와 좌표계가 일치한다.)
+if calib is not None and getattr(calib, 'px_per_mm_img', None):
+    ys, xs = np.where(work_mask > 0)
+    if ys.size > 0:
+        person_h_px = float(ys.max() - ys.min() + 1)
+        a4_h_px = float(calib.px_per_mm_img * 297.0)
+        ratio = float(a4_h_px / max(1.0, person_h_px))
+        if ratio < 0.08 or ratio > 0.35:
+            st.warning(
+                f"A4-인체 거리 불일치 가능성: A4가 사람 대비 너무 {'작' if ratio < 0.08 else '큽'}니다 (A4/키 픽셀비={ratio:.2f}). "
+                "A4를 몸에 밀착(가슴/복부)시키고 팔을 뻗지 말고, 전신이 프레임에 들어오게 다시 촬영하세요."
+            )
 
 result = compute_measurements(
     mask01=work_mask,
