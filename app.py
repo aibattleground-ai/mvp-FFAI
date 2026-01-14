@@ -57,6 +57,8 @@ GARMENT_PRIORS_CM_PER_SIDE = {
     "coat": (1.2, 2.5),
     "puffer": (2.0, 4.0),
 }
+MARKER_PDF_PATH = Path(__file__).resolve().parent / "main" / "assets" / "FormFoundry_A4_MarkerSheet_v1_1.pdf"
+
 MATERIAL_ADJ_CM = {
     "cotton blend": -0.1,
     "thin cotton": -0.2,
