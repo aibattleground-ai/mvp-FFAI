@@ -287,44 +287,101 @@ def _marker_object_corners_mm(marker_id: int) -> np.ndarray:
 
 
 def detect_a4_calibration(img_bgr: np.ndarray, px_per_mm: float, dict_name: str) -> A4Calib:
+    """
+    Robust ArUco detection for real photos:
+    - grayscale + equalizeHist
+    - upscale (helps when markers are small)
+    - relaxed DetectorParameters
+    - try multiple 4x4 dict variants (50/100/250/1000) and pick best hit
+    """
     _require_cv2()
 
-        # 여러 dict를 시도해서 required id(0,1,2,3)를 가장 잘 잡는 dict 선택
-    best = None  # (found_count, corners, ids, used_dict)
-    for dn in MARKER_DICT_CANDIDATES:
+    aruco = cv2.aruco
+
+    # 1) preprocessing
+    gray0 = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gray0 = cv2.equalizeHist(gray0)
+
+    # upscale to help small markers
+    scale = 3.0
+    gray = cv2.resize(gray0, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    # 2) relaxed detector params
+    if hasattr(aruco, "DetectorParameters"):
+        params = aruco.DetectorParameters()
+    else:
+        params = aruco.DetectorParameters_create()
+
+    # relax thresholds if available (OpenCV versions differ)
+    if hasattr(params, "minMarkerPerimeterRate"):
+        params.minMarkerPerimeterRate = 0.003
+    if hasattr(params, "adaptiveThreshWinSizeMin"):
+        params.adaptiveThreshWinSizeMin = 3
+    if hasattr(params, "adaptiveThreshWinSizeMax"):
+        params.adaptiveThreshWinSizeMax = 63
+    if hasattr(params, "adaptiveThreshWinSizeStep"):
+        params.adaptiveThreshWinSizeStep = 4
+    if hasattr(aruco, "CORNER_REFINE_SUBPIX") and hasattr(params, "cornerRefinementMethod"):
+        params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+
+    def _detect_with_dict_name(dn: str):
+        d = _aruco_dict_by_name(dn)
+        if hasattr(aruco, "ArucoDetector"):
+            det = aruco.ArucoDetector(d, params)
+            corners, ids, rej = det.detectMarkers(gray)
+        else:
+            corners, ids, rej = aruco.detectMarkers(gray, d, parameters=params)
+        return corners, ids, rej
+
+    # 3) try candidate dicts (prefer provided dict_name first)
+    dict_candidates = []
+    if dict_name:
+        dict_candidates.append(dict_name)
+    for dn in ["DICT_4X4_50", "DICT_4X4_100", "DICT_4X4_250", "DICT_4X4_1000"]:
+        if dn not in dict_candidates:
+            dict_candidates.append(dn)
+
+    best = None  # (num_required_found, corners, ids, tried_dn)
+    tried = []
+
+    for dn in dict_candidates:
+        tried.append(dn)
         try:
-            corners, ids, _rej = _aruco_detect_markers(img_bgr, dict_name=dn)
+            corners, ids, _ = _detect_with_dict_name(dn)
         except Exception:
             continue
         if ids is None or len(ids) == 0:
             continue
-        ids_list_tmp = [int(i) for i in ids.flatten().tolist()]
-        found_tmp = set(ids_list_tmp)
-        found_count = len(MARKER_IDS_REQUIRED & found_tmp)
-        if best is None or found_count > best[0]:
-            best = (found_count, corners, ids, dn)
-        if found_count == len(MARKER_IDS_REQUIRED):
+
+        ids_list = [int(i) for i in ids.flatten().tolist()]
+        found = set(ids_list)
+        score = len(found.intersection(MARKER_IDS_REQUIRED))
+
+        if best is None or score > best[0]:
+            best = (score, corners, ids, dn)
+        # early exit if all required found
+        if score == len(MARKER_IDS_REQUIRED):
             break
 
     if best is None:
-        return A4Calib(ok=False, debug={"reason": "no_markers", "tried": MARKER_DICT_CANDIDATES})
+        return A4Calib(ok=False, debug={"reason": "no_markers", "tried": tried})
 
-    found_count, corners, ids, used_dict = best
-
-
+    score, corners, ids, used_dn = best
     ids_list = [int(i) for i in ids.flatten().tolist()]
     found = set(ids_list)
     missing = list(MARKER_IDS_REQUIRED - found)
     if missing:
-        return A4Calib(ok=False, debug={"reason": "missing_markers", "missing": missing, "found": ids_list, "dict": used_dict})
+        return A4Calib(ok=False, debug={"reason": "missing_markers", "missing": missing, "found": ids_list, "used_dict": used_dn, "tried": tried})
 
+    # 4) build correspondences
     img_pts, obj_pts = [], []
     for c, mid in zip(corners, ids.flatten()):
         mid = int(mid)
         if mid not in MARKER_IDS_REQUIRED:
             continue
-        c2 = c.reshape(-1, 2).astype(np.float32)      # tl,tr,br,bl
-        obj = _marker_object_corners_mm(mid)          # tl,tr,br,bl (mm)
+        c2 = c.reshape(-1, 2).astype(np.float32)  # tl,tr,br,bl in *upscaled* coords
+        c2 = (c2 / scale).astype(np.float32)      # scale back to original image coords
+        obj = _marker_object_corners_mm(mid)      # tl,tr,br,bl (mm)
         img_pts.append(c2)
         obj_pts.append(obj)
 
@@ -333,7 +390,7 @@ def detect_a4_calibration(img_bgr: np.ndarray, px_per_mm: float, dict_name: str)
 
     H_img2mm, inliers = cv2.findHomography(img_pts, obj_pts, method=cv2.RANSAC, ransacReprojThreshold=4.0)
     if H_img2mm is None:
-        return A4Calib(ok=False, debug={"reason": "homography_failed"})
+        return A4Calib(ok=False, debug={"reason": "homography_failed", "used_dict": used_dn, "tried": tried})
 
     # mm -> px scale on A4 plane
     S = np.array([[px_per_mm, 0, 0], [0, px_per_mm, 0], [0, 0, 1]], dtype=np.float64)
@@ -348,10 +405,14 @@ def detect_a4_calibration(img_bgr: np.ndarray, px_per_mm: float, dict_name: str)
         H_img2px=H_img2px,
         px_per_mm=px_per_mm,
         a4_size_px=(a4_w_px, a4_h_px),
-        debug={"markers_found": ids_list, "px_per_mm": px_per_mm, "a4_size_px": (a4_w_px, a4_h_px)},
+        debug={
+            "markers_found": ids_list,
+            "px_per_mm": px_per_mm,
+            "a4_size_px": (a4_w_px, a4_h_px),
+            "used_dict": used_dn,
+            "tried": tried,
+        },
     )
-
-
 def warp_to_a4(img_bgr: np.ndarray, calib: A4Calib) -> np.ndarray:
     w_px, h_px = calib.a4_size_px
     return cv2.warpPerspective(img_bgr, calib.H_img2px, (w_px, h_px))
