@@ -803,8 +803,9 @@ if mode.startswith("고정밀") and calib and calib.ok:
 else:
     work_mask = mask01
 
-# Fallback px_per_cm: pose + height
+# Fallback px_per_cm: height scaling (pose preferred, mask bbox fallback)
 if not mode.startswith("고정밀"):
+    # 1) pose 기반(가능할 때만)
     if pose is not None:
         def get(i): return pose.xy.get(i) if pose and i in pose.xy else None
         top = get(0) or get(11) or get(12)
@@ -816,6 +817,14 @@ if not mode.startswith("고정밀"):
             pix_h = max(1.0, y_bot - y_top)
             px_per_cm = float(pix_h / float(height_cm))
 
+    # 2) pose가 없으면 마스크 bbox로 스케일 추정 (대체모드 안정성)
+    if (pose is None) or (px_per_cm == 14.0):
+        ys, xs = np.where(work_mask > 0)
+        if ys.size > 0:
+            pix_h = float(ys.max() - ys.min() + 1)
+            px_per_cm = float(pix_h / float(height_cm))
+
+with colR:
 with colR:
     st.subheader("Mask Preview")
     vis = np.dstack([work_mask * 255, work_mask * 255, work_mask * 255]).astype(np.uint8)
