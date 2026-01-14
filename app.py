@@ -718,6 +718,12 @@ with colL:
         use_demo = st.button("Demo 이미지로 테스트 (assets/demo_front.*)")
 
     uploaded = None if use_demo else st.file_uploader("전신 사진 업로드 (A4 마커 포함 권장)", type=["jpg", "jpeg", "png", "webp"])
+
+# --- Input guard: stop until an image is provided ---
+if uploaded_file is None:
+    st.info("Please upload a full-body photo with the A4 marker to start.")
+    st.stop()
+
     use_camera = False if use_demo else st.checkbox("카메라로 촬영 (가능하면)", value=False)
     camera_img = st.camera_input("Capture") if use_camera else None
 
