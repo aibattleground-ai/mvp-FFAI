@@ -64,6 +64,17 @@ GARMENT_PRIORS_CM_PER_SIDE = {
 }
 MARKER_PDF_PATH = Path(__file__).resolve().parent / "main" / "assets" / "FormFoundry_A4_MarkerSheet_v1_1.pdf"
 
+# --- Preflight: required asset check ---
+import streamlit as st
+
+if not MARKER_PDF_PATH.exists():
+    st.error(f"Marker PDF not found: {MARKER_PDF_PATH}")
+    st.stop()
+
+if not MARKER_PDF_PATH.is_file():
+    st.error(f"Marker PDF path is not a file: {MARKER_PDF_PATH}")
+    st.stop()
+
 MATERIAL_ADJ_CM = {
     "cotton blend": -0.1,
     "thin cotton": -0.2,
