@@ -328,11 +328,14 @@ def _get_pose_model():
     except Exception:
         return None
 
+
+def infer_pose_landmarks(img_bgr: np.ndarray, calib: Optional[A4Calib]) -> Optional[PoseLandmarks]:
     if mp is None:
         return None
     model = _get_pose_model()
     if model is None:
         return None
+
 
     img_rgb = _to_rgb(img_bgr)
     h, w = img_rgb.shape[:2]
