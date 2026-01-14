@@ -205,26 +205,61 @@ def _aruco_dict_by_name(name: str):
 
 def _aruco_detect_markers(img_bgr: np.ndarray, dict_name: str):
     """
+    Real-photo robust ArUco detection:
+    - grayscale + histogram equalization
+    - upscale for small markers (then scale corners back)
+    - relaxed DetectorParameters for Streamlit Cloud photos
     OpenCV 버전에 따라:
-    - 최신: cv2.aruco.ArucoDetector
-    - 구버전: cv2.aruco.detectMarkers + DetectorParameters_create
-    둘 다 지원.
+      - 최신: cv2.aruco.ArucoDetector
+      - 구버전: cv2.aruco.detectMarkers + DetectorParameters_create
     """
     aruco = cv2.aruco
     d = _aruco_dict_by_name(dict_name)
 
-    # parameters
+    # --- preprocess ---
+    scale = 3.0
+    if scale != 1.0:
+        img_up = cv2.resize(img_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    else:
+        img_up = img_bgr
+
+    gray = cv2.cvtColor(img_up, cv2.COLOR_BGR2GRAY)
+    try:
+        gray = cv2.equalizeHist(gray)
+    except Exception:
+        pass
+
+    # --- parameters (relaxed) ---
     if hasattr(aruco, "DetectorParameters"):
         params = aruco.DetectorParameters()
     else:
         params = aruco.DetectorParameters_create()
 
+    # 작은 마커/블러 대응
+    if hasattr(params, "minMarkerPerimeterRate"):
+        params.minMarkerPerimeterRate = 0.003
+    if hasattr(params, "adaptiveThreshWinSizeMin"):
+        params.adaptiveThreshWinSizeMin = 3
+    if hasattr(params, "adaptiveThreshWinSizeMax"):
+        params.adaptiveThreshWinSizeMax = 63
+    if hasattr(params, "adaptiveThreshWinSizeStep"):
+        params.adaptiveThreshWinSizeStep = 4
+
+    # 코너 정밀도 (가능하면)
+    if hasattr(aruco, "CORNER_REFINE_SUBPIX") and hasattr(params, "cornerRefinementMethod"):
+        params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+
+    # --- detect ---
     if hasattr(aruco, "ArucoDetector"):
         detector = aruco.ArucoDetector(d, params)
-        corners, ids, rej = detector.detectMarkers(img_bgr)
-        return corners, ids, rej
+        corners, ids, rej = detector.detectMarkers(gray)
+    else:
+        corners, ids, rej = aruco.detectMarkers(gray, d, parameters=params)
 
-    corners, ids, rej = aruco.detectMarkers(img_bgr, d, parameters=params)
+    # scale back corners to original-image coordinate system
+    if corners and scale != 1.0:
+        corners = [(c / scale).astype(np.float32) for c in corners]
+
     return corners, ids, rej
 
 
