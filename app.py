@@ -5,6 +5,13 @@
 
 
 from __future__ import annotations
+MP_IMPORT_ERROR = None
+try:
+    import mediapipe as mp
+except Exception as e:
+    mp = None
+    MP_IMPORT_ERROR = repr(e)
+
 
 import os
 os.environ["YOLO_CONFIG_DIR"] = "/tmp/Ultralytics"
@@ -23,11 +30,6 @@ try:
     import cv2
 except Exception:
     cv2 = None
-
-try:
-    import mediapipe as mp
-except Exception:
-    mp = None
 
 try:
     from ultralytics import YOLO
@@ -1006,7 +1008,14 @@ else:
         height_cm = float(user_height_cm)
 # --- Pose ---
 pose = infer_pose_landmarks(img_bgr, calib if mode.startswith("고정밀") else None)
-_pose_first_failed = (pose is None)
+
+if pose is None:
+    # mediapipe import 실패 vs landmark 추론 실패를 분리 표시
+    if mp is None:
+        st.warning("Pose 사용 불가: mediapipe import 실패 — " + str(MP_IMPORT_ERROR))
+    else:
+        st.warning("Pose 추론 실패: landmarks None (이미지 조건/크롭/해상도 이슈 가능)")
+
 
 # --- Segmentation ---
 mask01 = infer_person_mask_yolo(img_bgr, conf=yolo_conf)
