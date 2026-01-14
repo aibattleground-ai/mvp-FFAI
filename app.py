@@ -717,35 +717,40 @@ with colL:
     if demo_path is not None:
         use_demo = st.button("Demo 이미지로 테스트 (assets/demo_front.*)")
 
-    uploaded = None if use_demo else st.file_uploader("전신 사진 업로드 (A4 마커 포함 권장)", type=["jpg", "jpeg", "png", "webp"])
+    uploaded = None if use_demo else st.file_uploader(
+        "전신 사진 업로드 (A4 마커 포함 권장)",
+        type=["jpg", "jpeg", "png", "webp"],
+    )
 
-# --- Input guard: stop until an image is provided ---
-if (not use_demo) and (uploaded is None):
-    st.info("Please upload a full-body photo with the A4 marker to start.")
-    st.stop()
     use_camera = False if use_demo else st.checkbox("카메라로 촬영 (가능하면)", value=False)
     camera_img = st.camera_input("Capture") if use_camera else None
 
-    _require_cv2()
+# --- Resolve input image (defines img_bgr) ---
+_require_cv2()
 
-    if not use_demo and uploaded is None and camera_img is None:
-        st.info("이미지를 업로드하거나 카메라 촬영을 해주세요.")
+if use_demo:
+    img_bgr = cv2.imread(str(demo_path), cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        st.error("demo image read failed")
         st.stop()
-
+elif camera_img is not None:
     try:
-        if use_demo:
-            img_bgr = cv2.imread(str(demo_path), cv2.IMREAD_COLOR)
-            if img_bgr is None:
-                raise ValueError("demo image read failed")
-        elif camera_img is not None:
-            img_bgr = _read_image(camera_img)
-        else:
-            img_bgr = _read_image(uploaded)
+        img_bgr = _read_image(camera_img)
     except Exception as e:
-        st.error(f"이미지 로드 실패: {e}")
+        st.error(f"이미지 로드 실패(camera): {e}")
         st.stop()
+elif uploaded is not None:
+    try:
+        img_bgr = _read_image(uploaded)
+    except Exception as e:
+        st.error(f"이미지 로드 실패(upload): {e}")
+        st.stop()
+else:
+    st.info("Please upload a full-body photo with the A4 marker to start.")
+    st.stop()
 
-    st_image_compat(_to_rgb(img_bgr), caption="Original")
+st_image_compat(_to_rgb(img_bgr), caption="Original")
+
 
 
 # --- Calibration ---
