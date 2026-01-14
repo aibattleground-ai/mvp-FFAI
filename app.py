@@ -118,6 +118,35 @@ class A4Calib:
     debug: Optional[dict] = None
 
 
+
+def _calib_px_per_mm_img(calib):
+    """A4 평면(H_img2mm)에서 A4 높이(px)와 px/mm(이미지 기준)를 추정한다.
+    - H_img2mm: image(px) -> mm
+    - inv(H): mm -> image(px)
+    """
+    try:
+        import numpy as np
+        import cv2
+
+        H = calib.H_img2mm
+        Hinv = np.linalg.inv(H)
+
+        # A4 코너(mm) (W=210, H=297)
+        pts_mm = np.array([[0,0],[0,297],[210,0],[210,297]], dtype=np.float32).reshape(1,-1,2)
+        pts_img = cv2.perspectiveTransform(pts_mm, Hinv)[0]
+
+        left = float(np.linalg.norm(pts_img[0] - pts_img[1]))
+        right = float(np.linalg.norm(pts_img[2] - pts_img[3]))
+        a4_h_px = 0.5 * (left + right)
+
+        if a4_h_px <= 1.0:
+            return None, None
+
+        px_per_mm_img = a4_h_px / 297.0
+        return float(px_per_mm_img), float(a4_h_px)
+    except Exception:
+        return None, None
+
 @dataclass
 class MeasurementResult:
     px_per_cm: float
@@ -968,7 +997,24 @@ with colR:
 
 st.caption(f"px/cm = {px_per_cm:.2f}")
 
+
 # --- Measurements ---
+# 고정밀(A4)에서는 px/cm를 '워프 해상도'가 아니라 '원본 이미지에서의 A4 스케일'로 잡는다.
+if calib is not None:
+    px_per_mm_img, a4_h_px = _calib_px_per_mm_img(calib)
+    if px_per_mm_img is not None:
+        # A4가 사람과 같은 거리(대략)인지 sanity check
+        ys, xs = np.where(work_mask > 0)
+        if ys.size > 0 and a4_h_px is not None:
+            person_h_px = float(ys.max() - ys.min() + 1)
+            ratio = float(a4_h_px / max(1.0, person_h_px))  # (A4높이px / 사람키px)
+            if ratio < 0.08 or ratio > 0.35:
+                st.warning(
+                    f"A4-인체 거리 불일치 가능성: A4가 사람 대비 너무 {'작' if ratio < 0.08 else '큽'}니다 (A4/키 픽셀비={ratio:.2f}). "
+                    "A4를 몸에 밀착(가슴/복부)시키고 팔을 뻗지 말고, 전신이 프레임에 들어오게 다시 촬영하세요."
+                )
+        px_per_cm = float(px_per_mm_img * 10.0)
+
 result = compute_measurements(
     mask01=work_mask,
     pose=pose,

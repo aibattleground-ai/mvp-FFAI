@@ -7,3 +7,4 @@ torch
 torchvision
 timm
 mediapipe==0.10.31
+protobuf<5
