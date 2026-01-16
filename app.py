@@ -180,26 +180,26 @@ if mode.startswith("Demo"):
         st.markdown("## Layer 1 — Vision (Input)")
         st.markdown(f"**Demo Pack:** {preset.get('preset_id', pack_id)}  |  **Profile:** {preset.get('title', '-')}")
         if input_img is not None:
-            st.image(input_img, caption="Input image (display only in Demo mode)", use_container_width=True)
+            st.image(input_img, caption="Input image (display only in Demo mode)", width='stretch')
         else:
             st.warning("Input image could not be displayed (missing cv2/numpy).")
 
         st.markdown("### Step 01 — PnP & Homography (Demo)")
         ph = _make_placeholder("PnP/Homography\n(visualization placeholder)\nDemo mode: preset outputs")
         if ph is not None:
-            st.image(ph, caption="Reference-plane calibration visualization (demo)", use_container_width=True)
+            st.image(ph, caption="Reference-plane calibration visualization (demo)", width='stretch')
         else:
             st.caption("PnP/Homography visualization placeholder (no image backend).")
 
         st.markdown("### Step 02 — Pose (Demo)")
         ph2 = _make_placeholder("MediaPipe Pose\n(used for IK in full pipeline)\nDemo mode: preset outputs")
         if ph2 is not None:
-            st.image(ph2, caption="Pose landmarks visualization (demo)", use_container_width=True)
+            st.image(ph2, caption="Pose landmarks visualization (demo)", width='stretch')
 
         st.markdown("### Step 03 — Segmentation (Demo)")
         mask_img = _read_image(pack_dir / artifacts.get("mask", "step03_mask.png"))
         if mask_img is not None:
-            st.image(mask_img, caption="Person/garment mask (demo artifact)", use_container_width=True)
+            st.image(mask_img, caption="Person/garment mask (demo artifact)", width='stretch')
         else:
             st.caption("Segmentation mask placeholder.")
 
@@ -238,7 +238,7 @@ if mode.startswith("Demo"):
         st.markdown("## Layer 3 — 3D Engine (Demo Artifact)")
         drape_img = _read_image(pack_dir / artifacts.get("drape", "step06_drape.png"))
         if drape_img is not None:
-            st.image(drape_img, caption="Draped garment render / 3D preview (demo artifact)", use_container_width=True)
+            st.image(drape_img, caption="Draped garment render / 3D preview (demo artifact)", width='stretch')
         else:
             st.caption("3D preview placeholder.")
 
@@ -250,13 +250,13 @@ if mode.startswith("Demo"):
         g1, g2 = st.columns(2)
         with g1:
             if edge_img is not None:
-                st.image(edge_img, caption="ControlNet guide: Edge", use_container_width=True)
+                st.image(edge_img, caption="ControlNet guide: Edge", width='stretch')
         with g2:
             if depth_img is not None:
-                st.image(depth_img, caption="ControlNet guide: Depth", use_container_width=True)
+                st.image(depth_img, caption="ControlNet guide: Depth", width='stretch')
 
         if final_img is not None:
-            st.image(final_img, caption="Final photoreal output (demo artifact)", use_container_width=True)
+            st.image(final_img, caption="Final photoreal output (demo artifact)", width='stretch')
 
         with st.expander("Full preset.json (for auditing)", expanded=False):
             st.json(preset, expanded=True)
