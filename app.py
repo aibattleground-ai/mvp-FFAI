@@ -92,6 +92,124 @@ def _load_preset(pack_dir: Path) -> dict:
         }
 
 
+
+def _normalize_preset(preset: dict, pack_dir: Path) -> dict:
+    """
+    Make Demo Gallery robust across preset schema variants.
+    - Accepts either v0 (signals/body keys without _cm suffix, no artifacts mapping)
+    - Produces a normalized dict that the UI expects.
+    """
+    if not isinstance(preset, dict):
+        preset = {}
+    p = dict(preset)
+
+    # id / title
+    pid = p.get("preset_id") or p.get("id") or pack_dir.name
+    p["preset_id"] = pid
+
+    # notes (note -> notes)
+    if "notes" not in p and "note" in p:
+        p["notes"] = p.get("note")
+    if not isinstance(p.get("notes"), dict):
+        p["notes"] = {}
+
+    # profile label (avoid "Demo Pack: ... | Profile: Demo Pack: ...")
+    profile = p.get("profile") if isinstance(p.get("profile"), dict) else {}
+    body_type = profile.get("body_type") or profile.get("profile") or ""
+    garment = profile.get("garment_class") or ""
+    label = " / ".join([x for x in [str(body_type).strip(), str(garment).strip()] if x]) or str(pid)
+
+    title = p.get("title")
+    if (not isinstance(title, str)) or (not title.strip()) or ("Demo Pack:" in title):
+        p["title"] = label
+
+    # middleware normalization
+    mw = p.get("middleware") if isinstance(p.get("middleware"), dict) else {}
+    mw = dict(mw)
+
+    signals = mw.get("signals") if isinstance(mw.get("signals"), dict) else {}
+
+    body = mw.get("body_specs_cm") if isinstance(mw.get("body_specs_cm"), dict) else {}
+    body = dict(body)
+
+    # copy aliases both ways
+    alias_pairs = {
+        "shoulder_width_cm": "shoulder_width",
+        "chest_circ_cm": "chest_circ",
+        "waist_circ_cm": "waist_circ",
+        "hip_circ_cm": "hip_circ",
+    }
+    for dst, src in alias_pairs.items():
+        if dst not in body and src in body:
+            body[dst] = body.get(src)
+        if src not in body and dst in body:
+            body[src] = body.get(dst)
+
+    mw["body_specs_cm"] = body
+
+    # flatten common signal keys
+    for k in ["garment_class", "material", "material_props", "volume_offset", "warm_start"]:
+        v = mw.get(k)
+        if v in (None, "", {}, []):
+            if k in signals:
+                mw[k] = signals.get(k)
+
+    # ensure dicts
+    for k in ["material_props", "volume_offset", "warm_start"]:
+        if not isinstance(mw.get(k), dict):
+            mw[k] = {}
+
+    p["middleware"] = mw
+
+    # artifacts normalization (support either explicit mapping or implicit filenames)
+    artifacts = p.get("artifacts") if isinstance(p.get("artifacts"), dict) else {}
+    artifacts = dict(artifacts)
+
+    def pick_existing(names):
+        for n in names:
+            if isinstance(n, str) and (pack_dir / n).exists():
+                return n
+        return None
+
+    def set_if_missing(key, candidates):
+        if key in artifacts and isinstance(artifacts.get(key), str) and artifacts.get(key):
+            return
+        v = pick_existing(candidates)
+        if v:
+            artifacts[key] = v
+
+    # from vision paths (store as filename within pack_dir)
+    vision = p.get("vision") if isinstance(p.get("vision"), dict) else {}
+    v_calib = vision.get("pnp_homography_image")
+    v_pose = vision.get("pose_landmarks_image")
+    v_mask = vision.get("segmentation_mask_image")
+    if isinstance(v_calib, str):
+        artifacts.setdefault("calib", Path(v_calib).name)
+    if isinstance(v_pose, str):
+        artifacts.setdefault("pose", Path(v_pose).name)
+    if isinstance(v_mask, str):
+        artifacts.setdefault("mask", Path(v_mask).name)
+
+    # fallbacks by common filenames in your repo
+    set_if_missing("input", ["input.jpg", "input.png"])
+    set_if_missing("calib", ["step01_calib.jpg", "step01_calib.png", "pnp_homography.png"])
+    set_if_missing("pose", ["pose.png", "step02_pose.jpg", "step02_pose.png"])
+    set_if_missing("mask", ["mask.png", "step03_mask.png"])
+    set_if_missing("mask_overlay", ["step03_mask_overlay.jpg", "step03_mask_overlay.png"])
+    set_if_missing("drape", ["layer3_drape.png", "layer3_drape.jpg", "draped.png", "draped.jpg"])
+    set_if_missing("edge", ["layer4_edge.png", "layer4_edge.jpg", "edge.png", "edge.jpg"])
+    set_if_missing("depth", ["layer4_depth.png", "layer4_depth.jpg", "depth.png", "depth.jpg"])
+    set_if_missing("final", ["layer4_final.jpg", "layer4_final.png", "final.png", "final.jpg"])
+
+    # remove invalid artifact entries (avoid Path / None)
+    for k in list(artifacts.keys()):
+        if not isinstance(artifacts.get(k), str) or not artifacts.get(k):
+            del artifacts[k]
+
+    p["artifacts"] = artifacts
+    return p
+
+
 def _render_kv(title: str, d: dict):
     st.markdown(f"### {title}")
     st.json(d, expanded=True)
@@ -154,8 +272,7 @@ if mode.startswith("Demo"):
     colL, colR = st.columns([1.1, 1.0], gap="large")
 
     pack_dir = packs.get(pack_id, DEMO_GALLERY_DIR / pack_id)
-    preset = _load_preset(pack_dir)
-
+    preset = _normalize_preset(_load_preset(pack_dir), pack_dir)
     artifacts = preset.get("artifacts", {})
     note = preset.get("notes", {})
     # robust note handling (note may be dict or string)
