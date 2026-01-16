@@ -504,13 +504,18 @@ def _get_pose_model():
         return None
 
 
-def infer_pose_landmarks(img_bgr: np.ndarray, calib: Optional[A4Calib]) -> Optional[PoseLandmarks]:
+def infer_pose_landmarks(
+    img_bgr: np.ndarray,
+    calib: Optional[A4Calib],
+    bbox_xyxy: Optional[Tuple[int, int, int, int]] = None,
+) -> Optional[PoseLandmarks]:
     """
     MediaPipe Pose is optional in MVP.
-    Robustness fix:
-      - run Pose on FULL image (not A4-warp)
-      - ensure uint8 + contiguous
-      - try multiple downscales (hi-res photos often fail with landmarks=None)
+
+    Robustness fixes:
+      - Prefer running Pose on a person-crop (from YOLO mask bbox) to enlarge subject.
+      - Ensure uint8 + contiguous.
+      - Try multiple downscales (hi-res photos often fail with landmarks=None).
     Returns landmarks in ORIGINAL image coordinates.
     """
     _require_cv2()
@@ -531,25 +536,41 @@ def infer_pose_landmarks(img_bgr: np.ndarray, calib: Optional[A4Calib]) -> Optio
     if h0 < 2 or w0 < 2:
         return None
 
-    # smaller-first tends to be more stable for BlazePose on server/CPU
+    # optional person crop (to increase subject size)
+    ox, oy = 0, 0
+    base = img_rgb0
+    if bbox_xyxy is not None:
+        x1, y1, x2, y2 = bbox_xyxy
+        x1 = max(0, min(w0 - 1, int(x1)))
+        y1 = max(0, min(h0 - 1, int(y1)))
+        x2 = max(0, min(w0 - 1, int(x2)))
+        y2 = max(0, min(h0 - 1, int(y2)))
+        if x2 > x1 and y2 > y1:
+            ox, oy = x1, y1
+            base = img_rgb0[y1:y2 + 1, x1:x2 + 1]
+
+    hb, wb = base.shape[:2]
+    if hb < 2 or wb < 2:
+        return None
+
     max_side_list = []
-    for ms in (1024, 1280, 1600, max(h0, w0)):
+    for ms in (768, 1024, 1280, max(hb, wb)):
         if ms not in max_side_list:
             max_side_list.append(ms)
 
     for max_side in max_side_list:
         scale = 1.0
-        if max(h0, w0) > max_side:
-            scale = float(max_side) / float(max(h0, w0))
+        if max(hb, wb) > max_side:
+            scale = float(max_side) / float(max(hb, wb))
 
         if scale < 1.0:
-            new_w = int(round(w0 * scale))
-            new_h = int(round(h0 * scale))
+            new_w = int(round(wb * scale))
+            new_h = int(round(hb * scale))
             if new_w < 2 or new_h < 2:
                 continue
-            img_rgb = cv2.resize(img_rgb0, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            img_rgb = cv2.resize(base, (new_w, new_h), interpolation=cv2.INTER_AREA)
         else:
-            img_rgb = img_rgb0
+            img_rgb = base
 
         try:
             img_rgb.flags.writeable = False
@@ -570,15 +591,17 @@ def infer_pose_landmarks(img_bgr: np.ndarray, calib: Optional[A4Calib]) -> Optio
             continue
 
         h, w = img_rgb.shape[:2]
-        sx = float(w0) / float(w)
-        sy = float(h0) / float(h)
+        sx = float(wb) / float(w)
+        sy = float(hb) / float(h)
 
         xy = {}
         z = {}
         for i, lm in enumerate(lms):
+            # back to crop coords
             x = float(lm.x) * float(w) * sx
             y = float(lm.y) * float(h) * sy
-            xy[i] = (x, y)
+            # back to original coords
+            xy[i] = (x + float(ox), y + float(oy))
             z[i] = float(lm.z)
 
         return PoseLandmarks(xy=xy, z=z)
@@ -1059,37 +1082,33 @@ else:
     with colR:
         st.subheader("Fallback Mode")
         height_cm = float(user_height_cm)
-# --- Pose ---
-pose = infer_pose_landmarks(img_bgr, calib if mode.startswith("고정밀") else None)
-
-if pose is None:
-    # mediapipe import 실패 vs landmark 추론 실패를 분리 표시
-    if mp is None:
-        st.warning("Pose 사용 불가: mediapipe import 실패 — " + str(MP_IMPORT_ERROR))
-    else:
-        st.warning("Pose 추론 실패: landmarks None (이미지 조건/크롭/해상도 이슈 가능)")
-
-
-# --- Segmentation ---
+# --- Segmentation (run first: used for Pose crop) ---
 mask01 = infer_person_mask_yolo(img_bgr, conf=yolo_conf)
 if mask01 is None:
     st.error("인물 마스크 추론 실패. (YOLO/seg 모델 또는 person 검출 문제)")
     st.stop()
 
-# Pose fallback (after we have YOLO mask)
-if pose is None and mask01 is not None:
-    pose = infer_pose_landmarks_with_mask(img_bgr, mask01)
+# Compute padded bbox from mask for Pose crop
+bbox_xyxy = None
+ys, xs = np.where(mask01 > 0)
+if ys.size > 0:
+    x1, x2 = int(xs.min()), int(xs.max())
+    y1, y2 = int(ys.min()), int(ys.max())
+    # padding: 12% of max(side) to include head/feet/arms margin
+    pad = int(0.12 * max((x2 - x1 + 1), (y2 - y1 + 1)))
+    h_img, w_img = mask01.shape[:2]
+    x1 = max(0, x1 - pad)
+    y1 = max(0, y1 - pad)
+    x2 = min(w_img - 1, x2 + pad)
+    y2 = min(h_img - 1, y2 + pad)
+    if x2 > x1 and y2 > y1:
+        bbox_xyxy = (x1, y1, x2, y2)
 
+# --- Pose (after segmentation; run on person crop) ---
+pose = infer_pose_landmarks(img_bgr, calib if mode.startswith("고정밀") else None, bbox_xyxy=bbox_xyxy)
 if pose is None:
+    st.warning("Pose 추론 실패: landmarks None (이미지 조건/크롭/해상도 이슈 가능)")
     st.warning("Pose 추론 실패(또는 mediapipe 미설치). 일부 출력(팔/다리/회전)이 제한될 수 있습니다.")
-elif '_pose_first_failed' in globals() and _pose_first_failed:
-    st.caption("Pose: mask-crop fallback으로 복구했습니다.")
-
-# Ensure YOLO mask is aligned to the original image resolution (YOLO may output in resized space)
-h_img, w_img = img_bgr.shape[:2]
-if mask01.shape[:2] != (h_img, w_img):
-    mask01 = cv2.resize(mask01.astype(np.uint8), (w_img, h_img), interpolation=cv2.INTER_NEAREST)
-    mask01 = (mask01 > 0).astype(np.uint8)
 
 # Working plane for measurements:
 # In real photos the A4 marker is often held in hand (different plane than the whole body),
