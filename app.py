@@ -269,117 +269,264 @@ uploaded = st.file_uploader("Upload any full-body photo (for demo input display)
 # Demo Gallery
 # =========================
 if mode.startswith("Demo"):
-    colL, colR = st.columns([1.1, 1.0], gap="large")
+    # =========================
+    # Stable Demo Gallery (Always Success)
+    # - Outputs are preset for stability.
+    # - Visual artifacts below are generated offline from the same pipeline stack:
+    #   OpenCV (PnP/Homography), MediaPipe Pose, YOLOv8-seg (mask), etc.
+    # =========================
+    import json
+    from pathlib import Path
 
+    def _resolve_demo_path(x, pack_dir: Path) -> Path | None:
+        if not x:
+            return None
+        try:
+            q = Path(str(x))
+        except Exception:
+            return None
+        if q.is_absolute():
+            return q
+        xs = str(x)
+        if xs.startswith("assets/"):
+            return REPO_ROOT / xs
+        return pack_dir / q
+
+    def _pick_existing(pack_dir: Path, *cands: str) -> Path | None:
+        for c in cands:
+            if not c:
+                continue
+            pp = _resolve_demo_path(c, pack_dir)
+            if pp and pp.exists():
+                return pp
+        return None
+
+    def _safe_dict(x):
+        return x if isinstance(x, dict) else {}
+
+    def _get_num(d: dict, *keys):
+        for k in keys:
+            if k in d and d[k] is not None:
+                try:
+                    return float(d[k])
+                except Exception:
+                    pass
+        return None
+
+    # Layout
+    colL, colR = st.columns([1.15, 0.85], gap="large")
+
+    # Load pack preset
     pack_dir = packs.get(pack_id, DEMO_GALLERY_DIR / pack_id)
-    preset = _normalize_preset(_load_preset(pack_dir), pack_dir)
-    artifacts = preset.get("artifacts", {})
-    note = preset.get("notes", {})
-    # robust note handling (note may be dict or string)
-    try:
-        disclaimer = note.get("disclaimer", "Demo Gallery: preset outputs for stability.")
-    except Exception:
-        disclaimer = str(note) if note is not None else "Demo Gallery: preset outputs for stability."
+    preset = _load_preset(pack_dir)
 
+    vision = _safe_dict(preset.get("vision", {}))
+    middleware = _safe_dict(preset.get("middleware", {}))
+    body = _safe_dict(middleware.get("body_specs_cm", {}))
+    signals = _safe_dict(middleware.get("signals", {}))
+    artifacts = _safe_dict(preset.get("artifacts", {}))
+    notes = _safe_dict(preset.get("notes", {}))
+
+    # Profile strings
+    profile = _safe_dict(preset.get("profile", {})) or _safe_dict(preset.get("meta", {}))
+    body_type = (profile.get("body_type") or profile.get("profile") or "Athletic")
+    garment_class = (signals.get("garment_class") or middleware.get("garment_class") or profile.get("garment_class") or "-")
+    material = (signals.get("material") or middleware.get("material") or profile.get("material") or "-")
+
+    # Demo disclaimer
+    disclaimer = notes.get("disclaimer") or "Demo Gallery outputs are preset for stability. Live inference is available under Experimental mode."
     st.info(disclaimer)
 
-    # Input image (either preset input.jpg if exists, or upload)
-    input_img = None
-    if use_upload_as_input:
-        input_img = _read_upload(uploaded)
-        if input_img is None:
-            # fallback to preset input file
-            input_img = _read_image(pack_dir / artifacts.get("input", "input.jpg"))
-    else:
-        input_img = _read_image(pack_dir / artifacts.get("input", "input.jpg"))
+    # Resolve images (prefer preset fields, then common filenames)
+    input_img_path = _pick_existing(pack_dir,
+        vision.get("input_image"),
+        "input.jpg", "input.png"
+    )
+
+    step01_path = _pick_existing(pack_dir,
+        vision.get("pnp_homography_image"),
+        artifacts.get("pnp"),
+        artifacts.get("calib"),
+        "step01_calib.jpg", "step01_calib.png",
+        "pnp_homography.png", "pnp_homography.jpg",
+        "pnp_homography.png", "pnp_homography.jpg",
+        "pnp_homography.png"
+    )
+
+    step02_path = _pick_existing(pack_dir,
+        vision.get("pose_landmarks_image"),
+        artifacts.get("pose"),
+        "step02_pose.jpg", "step02_pose.png",
+        "pose.png", "pose.jpg"
+    )
+
+    step03_overlay_path = _pick_existing(pack_dir,
+        artifacts.get("mask_overlay"),
+        "step03_mask_overlay.jpg", "step03_mask_overlay.png"
+    )
+    step03_mask_path = _pick_existing(pack_dir,
+        vision.get("segmentation_mask_image"),
+        artifacts.get("mask"),
+        "step03_mask.png", "mask.png"
+    )
+
+    drape_path = _pick_existing(pack_dir,
+        artifacts.get("drape"),
+        "layer3_drape.png", "draped.png", "layer3_drape.jpg"
+    )
+    edge_path = _pick_existing(pack_dir,
+        artifacts.get("edge"),
+        "layer4_edge.png", "edge.png", "layer4_edge.jpg"
+    )
+    depth_path = _pick_existing(pack_dir,
+        artifacts.get("depth"),
+        "layer4_depth.png", "depth.png", "layer4_depth.jpg"
+    )
+    final_path = _pick_existing(pack_dir,
+        artifacts.get("final"),
+        "layer4_final.jpg", "final.jpg", "layer4_final.png", "final.png"
+    )
+
+    # Numbers (support both *_cm and legacy keys)
+    shoulder = _get_num(body, "shoulder_width_cm", "shoulder_width")
+    chest = _get_num(body, "chest_circ_cm", "chest_circ")
+    waist = _get_num(body, "waist_circ_cm", "waist_circ")
+    hip = _get_num(body, "hip_circ_cm", "hip_circ")
+
+    def _fmt_cm(x):
+        return "-" if x is None else f"{x:.1f} cm"
 
     with colL:
         st.markdown("## Layer 1 — Vision (Input)")
-        st.markdown(f"**Demo Pack:** {preset.get('preset_id', pack_id)}  |  **Profile:** {preset.get('title', '-')}")
-        if input_img is not None:
-            st.image(input_img, caption="Input image (display only in Demo mode)", width='stretch')
-        else:
-            st.warning("Input image could not be displayed (missing cv2/numpy).")
+        st.caption(f"Demo Pack: {pack_id} | Profile: {body_type} / {garment_class} | material: {material}")
+        st.markdown("**Pipeline trace (Demo Artifact):** OpenCV (PnP/Homography) → MediaPipe Pose → YOLOv8-seg (Mask)")
+
+        # Input image display
+        if use_upload_as_input and uploaded is not None:
+            try:
+                st.image(uploaded, caption="Input image (display only in Demo mode)", width='stretch')
+            except Exception:
+                st.warning("Uploaded image could not be displayed.")
+        elif input_img_path and input_img_path.exists():
+            img = _read_image(input_img_path)
+            if img is not None:
+                st.image(img, caption="Input image (demo pack)", width='stretch')
 
         st.markdown("### Step 01 — PnP & Homography (Demo)")
-        ph = _make_placeholder("PnP/Homography\n(visualization placeholder)\nDemo mode: preset outputs")
-        if ph is not None:
-            st.image(ph, caption="Reference-plane calibration visualization (demo)", width='stretch')
+        if step01_path and step01_path.exists():
+            img = _read_image(step01_path)
+            if img is not None:
+                st.image(img, caption="OpenCV: reference-plane calibration (demo artifact)", width='stretch')
+            else:
+                st.warning(f"Unreadable image: {step01_path.name}")
         else:
-            st.caption("PnP/Homography visualization placeholder (no image backend).")
+            st.info("PnP/Homography visualization placeholder (demo artifact not found).")
 
         st.markdown("### Step 02 — Pose (Demo)")
-        ph2 = _make_placeholder("MediaPipe Pose\n(used for IK in full pipeline)\nDemo mode: preset outputs")
-        if ph2 is not None:
-            st.image(ph2, caption="Pose landmarks visualization (demo)", width='stretch')
+        if step02_path and step02_path.exists():
+            img = _read_image(step02_path)
+            if img is not None:
+                st.image(img, caption="MediaPipe Pose landmarks (demo artifact)", width='stretch')
+            else:
+                st.warning(f"Unreadable image: {step02_path.name}")
+        else:
+            st.info("Pose landmarks placeholder (demo artifact not found).")
 
         st.markdown("### Step 03 — Segmentation (Demo)")
-        mask_img = _read_image(pack_dir / artifacts.get("mask", "step03_mask.png"))
-        if mask_img is not None:
-            st.image(mask_img, caption="Person/garment mask (demo artifact)", width='stretch')
-        else:
-            st.caption("Segmentation mask placeholder.")
+        cA, cB = st.columns(2)
+        with cA:
+            if step03_overlay_path and step03_overlay_path.exists():
+                img = _read_image(step03_overlay_path)
+                if img is not None:
+                    st.image(img, caption="YOLOv8-seg mask overlay (demo artifact)", width='stretch')
+                else:
+                    st.warning(f"Unreadable image: {step03_overlay_path.name}")
+            else:
+                st.info("Mask overlay placeholder (demo artifact not found).")
+        with cB:
+            if step03_mask_path and step03_mask_path.exists():
+                img = _read_image(step03_mask_path)
+                if img is not None:
+                    st.image(img, caption="Binary mask (demo artifact)", width='stretch')
+                else:
+                    st.warning(f"Unreadable image: {step03_mask_path.name}")
+            else:
+                st.info("Mask placeholder (demo artifact not found).")
 
     with colR:
         st.markdown("## Layer 2 — Middleware (Preset Output)")
-        middleware = preset.get("middleware", {})
-        body = middleware.get("body_specs_cm", {})
-
-        # Compact output block (judge-friendly)
         st.markdown("### Body Specs (Output)")
-        def _v(x):
-            return "-" if x is None else f"{float(x):.1f} cm"
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.metric("Shoulder Width", _v(body.get("shoulder_width_cm")))
-            st.metric("Chest Circumference", _v(body.get("chest_circ_cm")))
-        with c2:
-            st.metric("Waist Circumference", _v(body.get("waist_circ_cm")))
-            st.metric("Hip Circumference", _v(body.get("hip_circ_cm")))
+        m1, m2 = st.columns(2)
+        with m1:
+            st.metric("Shoulder Width", _fmt_cm(shoulder))
+            st.metric("Chest Circumference", _fmt_cm(chest))
+        with m2:
+            st.metric("Waist Circumference", _fmt_cm(waist))
+            st.metric("Hip Circumference", _fmt_cm(hip))
 
         st.markdown("### Clothing & Physics Signals")
-        st.write({
-            "garment_class": middleware.get("garment_class", "-"),
-            "material": middleware.get("material", "-"),
-            "material_props": middleware.get("material_props", {}),
-            "volume_offset": middleware.get("volume_offset", {}),
-            "warm_start": middleware.get("warm_start", {}),
+        st.json({
+            "garment_class": garment_class,
+            "material": material,
+            "material_props": signals.get("material_props", {}),
+            "volume_offset": signals.get("volume_offset", {}),
+            "warm_start": signals.get("warm_start", {}),
             "user_height_cm (display)": float(user_height_cm),
-        })
+        }, expanded=True)
 
         st.markdown("### Export JSON")
-        _download_json_button("Download preset middleware output JSON", preset, f"{preset.get('preset_id','demo')}_preset.json")
+        _download_json_button(
+            "Download preset (demo pack) JSON",
+            preset,
+            f"{pack_id}_preset.json"
+        )
 
         st.markdown("---")
         st.markdown("## Layer 3 — 3D Engine (Demo Artifact)")
-        drape_img = _read_image(pack_dir / artifacts.get("drape", "step06_drape.png"))
-        if drape_img is not None:
-            st.image(drape_img, caption="Draped garment render / 3D preview (demo artifact)", width='stretch')
+        if drape_path and drape_path.exists():
+            img = _read_image(drape_path)
+            if img is not None:
+                st.image(img, caption="Draped garment render / 3D preview (demo artifact)", width='stretch')
+            else:
+                st.warning(f"Unreadable image: {drape_path.name}")
         else:
-            st.caption("3D preview placeholder.")
+            st.info("Drape preview placeholder (demo artifact not found).")
 
+        st.markdown("---")
         st.markdown("## Layer 4 — GenAI Synthesis (Demo Artifacts)")
-        edge_img = _read_image(pack_dir / artifacts.get("edge", "step06_edge.png"))
-        depth_img = _read_image(pack_dir / artifacts.get("depth", "step06_depth.png"))
-        final_img = _read_image(pack_dir / artifacts.get("final", "step06_final.png"))
+        e1, e2 = st.columns(2)
+        with e1:
+            if edge_path and edge_path.exists():
+                img = _read_image(edge_path)
+                if img is not None:
+                    st.image(img, caption="ControlNet guide: Edge", width='stretch')
+                else:
+                    st.warning(f"Unreadable image: {edge_path.name}")
+            else:
+                st.info("Edge placeholder (demo artifact not found).")
+        with e2:
+            if depth_path and depth_path.exists():
+                img = _read_image(depth_path)
+                if img is not None:
+                    st.image(img, caption="ControlNet guide: Depth", width='stretch')
+                else:
+                    st.warning(f"Unreadable image: {depth_path.name}")
+            else:
+                st.info("Depth placeholder (demo artifact not found).")
 
-        g1, g2 = st.columns(2)
-        with g1:
-            if edge_img is not None:
-                st.image(edge_img, caption="ControlNet guide: Edge", width='stretch')
-        with g2:
-            if depth_img is not None:
-                st.image(depth_img, caption="ControlNet guide: Depth", width='stretch')
-
-        if final_img is not None:
-            st.image(final_img, caption="Final photoreal output (demo artifact)", width='stretch')
+        if final_path and final_path.exists():
+            img = _read_image(final_path)
+            if img is not None:
+                st.image(img, caption="Final photoreal output (demo artifact)", width='stretch')
+            else:
+                st.warning(f"Unreadable image: {final_path.name}")
+        else:
+            st.info("Final output placeholder (demo artifact not found).")
 
         with st.expander("Full preset.json (for auditing)", expanded=False):
             st.json(preset, expanded=True)
 
     st.stop()
-
 
 # =========================
 # Live (Experimental) mode
