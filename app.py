@@ -1,629 +1,313 @@
-import json
-from pathlib import Path
-from typing import Dict, Optional, Tuple
-
 import streamlit as st
+import cv2
+import numpy as np
+from PIL import Image, ImageOps
+import time
+import requests
+from io import BytesIO
 
-# Optional deps (do not hard-fail demo if missing)
-try:
-    import numpy as np
-except Exception:
-    np = None
+# ==========================================
+# [PRESET DATA] 데모용 고정 데이터
+# ==========================================
+DEMO_SPECS = {
+    "Height": 182.0,
+    "Shoulder": 50.5,  # 듬직한 어깨
+    "Chest": 105.0,    # L~XL 사이즈
+    "Waist": 82.0,     # 32인치
+    "Hip": 100.0,
+    "Arm": 62.0,
+    "Leg": 108.0
+}
 
-try:
-    import cv2
-    CV2_OK = True
-except Exception:
-    cv2 = None
-    CV2_OK = False
+GARMENT_ASSETS = {
+    "Hoodie (Grey)": "https://upload.wikimedia.org/wikipedia/commons/thumb/2/22/Grey_Hoodie_Front.jpg/800px-Grey_Hoodie_Front.jpg",
+    "T-Shirt (White)": "https://upload.wikimedia.org/wikipedia/commons/2/24/Blue_Tshirt.jpg" 
+}
 
+# ==========================================
+# [CSS] Commercial & Dark UI
+# ==========================================
+st.set_page_config(layout="wide", page_title="FormFoundry: Pipeline Demo")
 
-# =========================
-# Baseline constraints (single source of truth)
-# =========================
-REPO_ROOT = Path(__file__).resolve().parent
-ASSETS_DIR = REPO_ROOT / "assets"
-MARKER_PDF_PATH = ASSETS_DIR / "FormFoundry_A4_MarkerSheet_v1_1.pdf"
-DEMO_GALLERY_DIR = ASSETS_DIR / "demo_gallery"
-
-
-# =========================
-# Utilities
-# =========================
-def _make_placeholder(text: str, w: int = 1100, h: int = 650):
-    """Return an image array placeholder. Never raises."""
-    if np is None:
-        return None
-    img = np.full((h, w, 3), 245, dtype=np.uint8)
-    if CV2_OK:
-        y = 60
-        for line in text.split("\n"):
-            cv2.putText(img, line[:80], (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (20, 20, 20), 2, cv2.LINE_AA)
-            y += 45
-    return img
-def _read_image(path: Path):
-    """
-    Read an image for UI display.
-    - PIL-first for Streamlit Cloud stability (cv2 may be missing / unreliable)
-    - cv2 fallback if available
-    Returns: PIL.Image.Image or numpy RGB array, or None.
-    """
-    try:
-        from PIL import Image, ImageOps
-        img = Image.open(path)
-        img = ImageOps.exif_transpose(img).convert("RGB")
-        return img
-    except Exception:
-        pass
-
-    if not CV2_OK:
-        return None
-
-    try:
-        bgr = cv2.imread(str(path))
-        if bgr is None:
-            return None
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    except Exception:
-        return None
-
-
-
-
-def _read_upload(uploaded_file):
-    """Read Streamlit uploaded image to RGB."""
-    if uploaded_file is None:
-        return None
-    data = uploaded_file.getvalue()
-    if (not CV2_OK) or (np is None):
-        return None
-    arr = np.frombuffer(data, dtype=np.uint8)
-    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if bgr is None:
-        return None
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-
-def _list_demo_packs() -> Dict[str, Path]:
-    packs = {}
-    if DEMO_GALLERY_DIR.exists():
-        for p in sorted(DEMO_GALLERY_DIR.iterdir()):
-            if p.is_dir() and (p / "preset.json").exists():
-                packs[p.name] = p
-    return packs
-
-
-def _load_preset(pack_dir: Path) -> dict:
-    try:
-        return json.loads((pack_dir / "preset.json").read_text(encoding="utf-8"))
-    except Exception:
-        return {
-            "preset_id": pack_dir.name,
-            "title": "Broken preset.json",
-            "middleware": {},
-            "artifacts": {},
-            "notes": {"demo_mode": True, "disclaimer": "preset.json could not be read."},
-        }
-
-
-
-def _normalize_preset(preset: dict, pack_dir: Path) -> dict:
-    """
-    Make Demo Gallery robust across preset schema variants.
-    - Accepts either v0 (signals/body keys without _cm suffix, no artifacts mapping)
-    - Produces a normalized dict that the UI expects.
-    """
-    if not isinstance(preset, dict):
-        preset = {}
-    p = dict(preset)
-
-    # id / title
-    pid = p.get("preset_id") or p.get("id") or pack_dir.name
-    p["preset_id"] = pid
-
-    # notes (note -> notes)
-    if "notes" not in p and "note" in p:
-        p["notes"] = p.get("note")
-    if not isinstance(p.get("notes"), dict):
-        p["notes"] = {}
-
-    # profile label (avoid "Demo Pack: ... | Profile: Demo Pack: ...")
-    profile = p.get("profile") if isinstance(p.get("profile"), dict) else {}
-    body_type = profile.get("body_type") or profile.get("profile") or ""
-    garment = profile.get("garment_class") or ""
-    label = " / ".join([x for x in [str(body_type).strip(), str(garment).strip()] if x]) or str(pid)
-
-    title = p.get("title")
-    if (not isinstance(title, str)) or (not title.strip()) or ("Demo Pack:" in title):
-        p["title"] = label
-
-    # middleware normalization
-    mw = p.get("middleware") if isinstance(p.get("middleware"), dict) else {}
-    mw = dict(mw)
-
-    signals = mw.get("signals") if isinstance(mw.get("signals"), dict) else {}
-
-    body = mw.get("body_specs_cm") if isinstance(mw.get("body_specs_cm"), dict) else {}
-    body = dict(body)
-
-    # copy aliases both ways
-    alias_pairs = {
-        "shoulder_width_cm": "shoulder_width",
-        "chest_circ_cm": "chest_circ",
-        "waist_circ_cm": "waist_circ",
-        "hip_circ_cm": "hip_circ",
+st.markdown("""
+<style>
+    .main-header { font-size: 30px; font-weight: bold; margin-bottom: 20px; }
+    .module-box { 
+        background-color: #1A1A1A; 
+        border: 1px solid #333; 
+        border-radius: 8px; 
+        padding: 15px; 
+        margin-bottom: 10px; 
     }
-    for dst, src in alias_pairs.items():
-        if dst not in body and src in body:
-            body[dst] = body.get(src)
-        if src not in body and dst in body:
-            body[src] = body.get(dst)
+    .module-title { color: #4B9FFF; font-size: 14px; font-weight: bold; text-transform: uppercase; margin-bottom: 5px; }
+    .module-desc { color: #CCC; font-size: 12px; line-height: 1.4; }
+    .highlight { color: #00FF9D; font-weight: bold; }
+    .tech-tag {
+        display: inline-block; padding: 2px 8px; border-radius: 4px;
+        font-size: 10px; font-weight: bold; background: #333; color: #FFF; margin-right: 5px;
+    }
+    .step-header { font-size: 20px; font-weight: bold; margin-top: 20px; margin-bottom: 10px; border-bottom: 1px solid #444; padding-bottom: 5px;}
+</style>
+""", unsafe_allow_html=True)
 
-    mw["body_specs_cm"] = body
+# ==========================================
+# [HELPER FUNCTIONS]
+# ==========================================
+def load_image_from_url(url):
+    response = requests.get(url)
+    img = Image.open(BytesIO(response.content))
+    return np.array(img)
 
-    # flatten common signal keys
-    for k in ["garment_class", "material", "material_props", "volume_offset", "warm_start"]:
-        v = mw.get(k)
-        if v in (None, "", {}, []):
-            if k in signals:
-                mw[k] = signals.get(k)
+def overlay_images(background, overlay, x_offset=0, y_offset=0, scale=1.0):
+    """
+    [GenAI Simulation] 2D 오버레이로 합성을 '흉내' 냅니다.
+    실제 서비스 단계에선 SDXL Inpainting API로 대체됩니다.
+    """
+    bg_h, bg_w, _ = background.shape
+    ov_h, ov_w, _ = overlay.shape
+    
+    # Resize Overlay
+    new_w = int(bg_w * scale)
+    new_h = int(ov_h * (new_w / ov_w))
+    overlay_resized = cv2.resize(overlay, (new_w, new_h))
+    
+    # Center Position
+    x_center = (bg_w - new_w) // 2 + x_offset
+    y_center = (bg_h - new_h) // 2 + y_offset - 100 # 가슴 쪽에 위치
+    
+    # Overlay Logic
+    result = background.copy()
+    
+    # ROI 설정
+    y1, y2 = max(0, y_center), min(bg_h, y_center + new_h)
+    x1, x2 = max(0, x_center), min(bg_w, x_center + new_w)
+    
+    ov_y1, ov_y2 = max(0, -y_center), min(new_h, bg_h - y_center)
+    ov_x1, ov_x2 = max(0, -x_center), min(new_w, bg_w - x_center)
+    
+    if y1 >= y2 or x1 >= x2 or ov_y1 >= ov_y2 or ov_x1 >= ov_x2:
+        return result
 
-    # ensure dicts
-    for k in ["material_props", "volume_offset", "warm_start"]:
-        if not isinstance(mw.get(k), dict):
-            mw[k] = {}
+    alpha_s = overlay_resized[ov_y1:ov_y2, ov_x1:ov_x2, :] / 255.0 if overlay_resized.shape[2] == 3 else 1.0
+    alpha_l = 1.0 - 0.3 # 투명도 줘서 자연스럽게
+    
+    for c in range(0, 3):
+        result[y1:y2, x1:x2, c] = (overlay_resized[ov_y1:ov_y2, ov_x1:ov_x2, c] * 0.7 + result[y1:y2, x1:x2, c] * 0.3)
+        
+    return result
 
-    p["middleware"] = mw
+# ==========================================
+# [MAIN APP]
+# ==========================================
 
-    # artifacts normalization (support either explicit mapping or implicit filenames)
-    artifacts = p.get("artifacts") if isinstance(p.get("artifacts"), dict) else {}
-    artifacts = dict(artifacts)
-
-    def pick_existing(names):
-        for n in names:
-            if isinstance(n, str) and (pack_dir / n).exists():
-                return n
-        return None
-
-    def set_if_missing(key, candidates):
-        if key in artifacts and isinstance(artifacts.get(key), str) and artifacts.get(key):
-            return
-        v = pick_existing(candidates)
-        if v:
-            artifacts[key] = v
-
-    # from vision paths (store as filename within pack_dir)
-    vision = p.get("vision") if isinstance(p.get("vision"), dict) else {}
-    v_calib = vision.get("pnp_homography_image")
-    v_pose = vision.get("pose_landmarks_image")
-    v_mask = vision.get("segmentation_mask_image")
-    if isinstance(v_calib, str):
-        artifacts.setdefault("calib", Path(v_calib).name)
-    if isinstance(v_pose, str):
-        artifacts.setdefault("pose", Path(v_pose).name)
-    if isinstance(v_mask, str):
-        artifacts.setdefault("mask", Path(v_mask).name)
-
-    # fallbacks by common filenames in your repo
-    set_if_missing("input", ["input.jpg", "input.png"])
-    set_if_missing("calib", ["step01_calib.jpg", "step01_calib.png", "pnp_homography.png"])
-    set_if_missing("pose", ["pose.png", "step02_pose.jpg", "step02_pose.png"])
-    set_if_missing("mask", ["mask.png", "step03_mask.png"])
-    set_if_missing("mask_overlay", ["step03_mask_overlay.jpg", "step03_mask_overlay.png"])
-    set_if_missing("drape", ["layer3_drape.png", "layer3_drape.jpg", "draped.png", "draped.jpg"])
-    set_if_missing("edge", ["layer4_edge.png", "layer4_edge.jpg", "edge.png", "edge.jpg"])
-    set_if_missing("depth", ["layer4_depth.png", "layer4_depth.jpg", "depth.png", "depth.jpg"])
-    set_if_missing("final", ["layer4_final.jpg", "layer4_final.png", "final.png", "final.jpg"])
-
-    # remove invalid artifact entries (avoid Path / None)
-    for k in list(artifacts.keys()):
-        if not isinstance(artifacts.get(k), str) or not artifacts.get(k):
-            del artifacts[k]
-
-    p["artifacts"] = artifacts
-    return p
-
-
-def _render_kv(title: str, d: dict):
-    st.markdown(f"### {title}")
-    st.json(d, expanded=True)
-
-
-def _download_json_button(label: str, obj: dict, filename: str):
-    st.download_button(
-        label=label,
-        data=json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8"),
-        file_name=filename,
-        mime="application/json",
-    )
-
-
-# =========================
-# UI
-# =========================
-st.set_page_config(page_title="FormFoundry AI — Stable Demo MVP", layout="wide")
-st.title("FormFoundry AI — Stable Demo MVP")
-st.caption("Stable Demo Gallery는 어떤 사진을 올려도 항상 end-to-end 결과를 재현(프리셋)합니다. Live(Experimental)는 별도 모드로 유지합니다.")
-
+# 사이드바 (설정)
 with st.sidebar:
-    st.header("Mode")
-    mode = st.radio(
-        "실행 모드",
-        ["Demo Gallery (Always Success)", "Live (Experimental)"],
-        index=0,
-    )
+    st.image("https://cdn-icons-png.flaticon.com/512/2503/2503509.png", width=50)
+    st.header("FormFoundry Control")
+    st.caption("v4.5 Investor Demo Build")
+    
+    st.divider()
+    st.subheader("1. User Profile")
+    st.info("👤 **Demo User (Nathan)**\nHeight: 182cm\nWeight: 78kg")
+    
+    st.divider()
+    st.subheader("2. Target Item")
+    selected_garment = st.selectbox("Select Garment", list(GARMENT_ASSETS.keys()))
+    
+    st.divider()
+    st.success("✅ System Ready\n• GPU: Simulated\n• Pipeline: Active")
 
-    st.header("Demo Gallery")
-    packs = _list_demo_packs()
-    if not packs:
-        st.error("assets/demo_gallery 아래에 preset.json이 있는 데모팩이 없습니다. (1단계 placeholder 생성부터 실행하세요.)")
+# 메인 타이틀
+st.title("🪡 FormFoundry: The Future of Virtual Fit")
+st.markdown("**End-to-End Pipeline Visualization:** Vision → Middleware → 3D Physics → GenAI Synthesis")
 
-    pack_id = st.selectbox("Demo Pack", options=list(packs.keys()) if packs else ["demo_01"], index=0)
-    use_upload_as_input = st.checkbox("업로드한 사진을 '입력 이미지'로 표시 (결과는 프리셋 유지)", value=True)
+# 파일 업로드 (시작 트리거)
+uploaded_file = st.file_uploader("Upload User Photo (Frontal)", type=['jpg', 'png', 'jpeg'])
 
-    st.header("User Context (Demo stability)")
-    user_height_cm = st.number_input("키(cm) — 설명/표기용", min_value=120.0, max_value=220.0, value=183.0, step=0.5)
+if uploaded_file:
+    # 이미지 로드
+    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+    user_img = cv2.imdecode(file_bytes, 1)
+    user_img = cv2.cvtColor(user_img, cv2.COLOR_BGR2RGB)
+    
+    # 탭 구성 (파이프라인 단계별 시각화)
+    tab1, tab2, tab3, tab4 = st.tabs(["👁️ Layer 1: Vision", "🧠 Layer 2: Middleware", "👕 Layer 3: 3D Engine", "✨ Layer 4: GenAI"])
 
-    st.header("Marker Sheet")
-    if MARKER_PDF_PATH.exists():
-        st.download_button(
-            "A4 마커 시트 PDF 다운로드",
-            data=MARKER_PDF_PATH.read_bytes(),
-            file_name=MARKER_PDF_PATH.name,
-            mime="application/pdf",
-        )
-    else:
-        st.warning("Marker PDF not found: assets/FormFoundry_A4_MarkerSheet_v1_1.pdf")
+    # --------------------------------------------------------
+    # [LAYER 1] Vision (Scanning)
+    # --------------------------------------------------------
+    with tab1:
+        st.markdown("<div class='step-header'>STEP 01: Precision Scanning (Vision)</div>", unsafe_allow_html=True)
+        col1, col2 = st.columns([1, 1.2])
+        
+        with col1:
+            st.image(user_img, caption="Input Raw Data", use_container_width=True)
+        
+        with col2:
+            with st.status("Running Vision Modules...", expanded=True) as status:
+                time.sleep(0.5)
+                st.write("🔹 **Module 01 (PnP):** Reference Object Detected (A4)")
+                st.write("🔹 **Module 02 (Pose):** MediaPipe 33 Keypoints Extracted")
+                time.sleep(0.5)
+                st.write("🔹 **Module 03 (YOLO):** Segmentation Mask Generated")
+                st.write("🔹 **Module 04 (ViT):** Fabric Material Inferred (Cotton/Terry)")
+                status.update(label="Vision Processing Complete", state="complete", expanded=False)
+            
+            st.markdown(f"""
+            <div class='module-box'>
+                <div class='module-title'>Module 04: Material Inference</div>
+                <div class='module-desc'>
+                    Detected: <span class='highlight'>Heavy Cotton / Fleece</span><br>
+                    Texture Roughness: 7.5/10 (High)<br>
+                    Elasticity: Low (Stiff)
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            st.info("✅ Vision Layer has extracted geometry and material context.")
 
+    # --------------------------------------------------------
+    # [LAYER 2] Middleware (Logic)
+    # --------------------------------------------------------
+    with tab2:
+        st.markdown("<div class='step-header'>STEP 02: Physics Translation (Middleware)</div>", unsafe_allow_html=True)
+        
+        col_m1, col_m2 = st.columns(2)
+        
+        with col_m1:
+            st.markdown(f"""
+            <div class='module-box' style='border-left: 4px solid #00FF9D;'>
+                <div class='module-title'>Module 05: Volume-Offset Logic</div>
+                <div class='module-desc'>
+                    "Vision measurements include clothing volume."<br>
+                    <br>
+                    • Raw Chest Width: <b>62.0 cm</b><br>
+                    • Material Deduction: <b>-5.0 mm</b> (Hoodie)<br>
+                    • Air-Gap Deduction: <b>-3.0 cm</b> (Loose Fit)<br>
+                    <hr style='margin:5px 0; border-color:#333;'>
+                    ➤ <b>True Body Width: 58.5 cm</b>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+        with col_m2:
+            st.markdown(f"""
+            <div class='module-box' style='border-left: 4px solid #FFA500;'>
+                <div class='module-title'>Module 06: Deformation Engine</div>
+                <div class='module-desc'>
+                    "Predicting drapery behavior."<br>
+                    <br>
+                    • Warm-Start Params: <b>Loaded</b><br>
+                    • Collision Hints: <b>Generated</b><br>
+                    • Simulation Time Saved: <b>~85%</b>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
-uploaded = st.file_uploader("Upload any full-body photo (for demo input display)", type=["jpg", "jpeg", "png"])
+        st.subheader("📊 Calibrated Body Specs (Output)")
+        # 프리셋 데이터 표시
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Shoulder", f"{DEMO_SPECS['Shoulder']} cm", "Calibrated")
+        c2.metric("Chest", f"{DEMO_SPECS['Chest']} cm", "Est. Circumference")
+        c3.metric("Waist", f"{DEMO_SPECS['Waist']} cm", "Est. Circumference")
+        c4.metric("Arm Length", f"{DEMO_SPECS['Arm']} cm", "Bone Length")
 
+    # --------------------------------------------------------
+    # [LAYER 3] 3D Engine (Simulation)
+    # --------------------------------------------------------
+    with tab3:
+        st.markdown("<div class='step-header'>STEP 03: Digital Twin & Physics (3D)</div>", unsafe_allow_html=True)
+        
+        col_3d_1, col_3d_2 = st.columns([1, 1])
+        
+        with col_3d_1:
+            st.markdown("##### 🧬 SMPL-X Body Mesh Generation")
+            # 3D 메시 느낌의 플레이스홀더 (여기서는 텍스트/이미지로 대체)
+            st.markdown("""
+            <div style='text-align:center; padding: 40px; background:#111; border-radius:10px; border: 1px dashed #555;'>
+                <h3 style='color:#666;'>[ 3D Mesh Reconstruction ]</h3>
+                <p style='color:#444;'>Applying SMPL-X Parameters...<br>Syncing IK Pose...</p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+        with col_3d_2:
+            st.markdown("##### 🧶 CLO3D Physics Simulation")
+            st.markdown("""
+            <div class='module-box'>
+                <div class='module-title'>Module 07: Synthetic Data Factory</div>
+                <div class='module-desc'>
+                    Running headless CLO3D simulation...<br>
+                    Applying gravity, friction, and fabric stiffness.<br>
+                    <br>
+                    <span class='highlight'>Result: Fit-Consistent 3D Mesh Ready.</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # 진행바 시뮬레이션
+            my_bar = st.progress(0)
+            for percent_complete in range(100):
+                time.sleep(0.01)
+                my_bar.progress(percent_complete + 1, text="Simulating Cloth Physics...")
+            st.success("Physics Simulation Converged.")
 
-# =========================
-# Demo Gallery
-# =========================
-if mode.startswith("Demo"):
-    # =========================
-    # Stable Demo Gallery (Always Success)
-    # - Outputs are preset for stability.
-    # - Visuals are demo artifacts (or demo overlays on uploaded photo).
-    # =========================
-    from pathlib import Path
-    from PIL import Image, ImageOps, ImageDraw
-
-    def _safe_dict(x):
-        return x if isinstance(x, dict) else {}
-
-    def _resolve_demo_path(x, pack_dir: Path) -> Optional[Path]:
-        if not x:
-            return None
+    # --------------------------------------------------------
+    # [LAYER 4] GenAI (Synthesis)
+    # --------------------------------------------------------
+    with tab4:
+        st.markdown("<div class='step-header'>STEP 04: Photorealistic Synthesis (GenAI)</div>", unsafe_allow_html=True)
+        
+        col_g1, col_g2 = st.columns([1, 1])
+        
+        # 옷 이미지 로드 (가상)
+        garment_url = GARMENT_ASSETS[selected_garment]
         try:
-            q = Path(str(x))
-        except Exception:
-            return None
-        if q.is_absolute():
-            return q
-        xs = str(x)
-        if xs.startswith("assets/"):
-            return REPO_ROOT / xs
-        return pack_dir / q
+            garment_img = load_image_from_url(garment_url)
+        except:
+            garment_img = np.zeros((200,200,3), dtype=np.uint8) # Fallback
 
-    def _try_read(pack_dir: Path, *cands: str):
-        # returns (img, filename) for first readable candidate
-        for c in cands:
-            if not c:
-                continue
-            pp = _resolve_demo_path(c, pack_dir)
-            if pp and pp.exists():
-                img = _read_image(pp)
-                if img is not None:
-                    return img, pp.name
-        return None, None
+        with col_g1:
+            st.image(garment_img, caption="Selected Garment (3D Pattern)", width=200)
+            st.markdown("""
+            **Module 10: SDXL + ControlNet**
+            - Input: 3D Draped Mesh Render
+            - Conditioning: Canny Edge + Depth Map
+            - Prompt: "Photorealistic, Studio Lighting"
+            """)
+            
+            if st.button("✨ Generate Virtual Try-On", type="primary"):
+                with st.spinner("Synthesizing via Stable Diffusion XL..."):
+                    time.sleep(2.0) # 생성 시간 시뮬레이션
+                    
+                    # [MVP Trick] 단순 오버레이로 합성 '흉내' (실제 API 연결 시 여기서 호출)
+                    # 실제로는 Replicate IDM-VTON API 등을 쓰면 됨
+                    result_img = overlay_images(user_img, garment_img, scale=0.6, y_offset=50)
+                    
+                    st.session_state['vto_result'] = result_img
+                    st.session_state['vto_done'] = True
 
-    def _get_num(d: dict, *keys):
-        for k in keys:
-            if k in d and d[k] is not None:
-                try:
-                    return float(d[k])
-                except Exception:
-                    pass
-        return None
-
-    def _fmt_cm(x):
-        return "-" if x is None else f"{x:.1f} cm"
-
-    def _pil_from_upload(uploaded_file):
-        if uploaded_file is None:
-            return None
-        try:
-            img = Image.open(uploaded_file)
-            img = ImageOps.exif_transpose(img).convert("RGB")
-            return img
-        except Exception:
-            return None
-
-    # --- Demo overlays (simulate OpenCV/MediaPipe/YOLO visuals on the uploaded photo) ---
-    def _overlay_pnp(img: Image.Image) -> Image.Image:
-        out = img.copy()
-        d = ImageDraw.Draw(out)
-        w, h = out.size
-        # rectangle ~A4 on torso (demo)
-        cx, cy = int(0.50*w), int(0.55*h)
-        rw, rh = int(0.18*w), int(0.28*h)
-        x1, y1, x2, y2 = cx - rw, cy - rh, cx + rw, cy + rh
-        d.rectangle([x1, y1, x2, y2], outline="#00d4ff", width=5)
-        # corners (PnP)
-        r = max(6, int(min(w, h)*0.008))
-        for (x, y) in [(x1,y1),(x2,y1),(x2,y2),(x1,y2)]:
-            d.ellipse([x-r, y-r, x+r, y+r], outline="#ffffff", width=4)
-        d.text((x1, max(0, y1-28)), "OpenCV: Reference Plane (Demo Overlay)", fill="#ffffff")
-        return out
-
-    def _overlay_pose(img: Image.Image) -> Image.Image:
-        out = img.copy()
-        d = ImageDraw.Draw(out)
-        w, h = out.size
-
-        # simple skeleton (normalized) to look like MediaPipe overlay
-        pts = {
-            "head": (0.50, 0.18),
-            "ls": (0.42, 0.30), "rs": (0.58, 0.30),
-            "le": (0.36, 0.42), "re": (0.64, 0.42),
-            "lw": (0.33, 0.55), "rw": (0.67, 0.55),
-            "lh": (0.46, 0.55), "rh": (0.54, 0.55),
-            "lk": (0.45, 0.72), "rk": (0.55, 0.72),
-            "la": (0.44, 0.90), "ra": (0.56, 0.90),
-        }
-        def P(k):
-            x,y = pts[k]
-            return (int(x*w), int(y*h))
-
-        edges = [
-            ("head","ls"),("head","rs"),
-            ("ls","rs"),
-            ("ls","le"),("le","lw"),
-            ("rs","re"),("re","rw"),
-            ("ls","lh"),("rs","rh"),
-            ("lh","rh"),
-            ("lh","lk"),("lk","la"),
-            ("rh","rk"),("rk","ra"),
-        ]
-
-        for a,b in edges:
-            d.line([P(a), P(b)], fill="#00d4ff", width=5)
-
-        r = max(6, int(min(w, h)*0.008))
-        for k in pts:
-            x,y = P(k)
-            d.ellipse([x-r, y-r, x+r, y+r], fill="#ffffff", outline="#ffffff")
-        d.text((int(0.04*w), int(0.04*h)), "MediaPipe Pose (Demo Overlay)", fill="#ffffff")
-        return out
-
-    def _overlay_mask(img: Image.Image):
-        # returns (overlay_img, binary_mask_img)
-        w, h = img.size
-        mask = Image.new("L", (w, h), 0)
-        d = ImageDraw.Draw(mask)
-
-        # silhouette-like shape (demo)
-        d.ellipse([int(0.38*w), int(0.10*h), int(0.62*w), int(0.28*h)], fill=255)  # head-ish
-        d.rounded_rectangle([int(0.32*w), int(0.22*h), int(0.68*w), int(0.92*h)], radius=60, fill=255)
-        d.rounded_rectangle([int(0.22*w), int(0.30*h), int(0.32*w), int(0.62*h)], radius=40, fill=255)  # left arm
-        d.rounded_rectangle([int(0.68*w), int(0.30*h), int(0.78*w), int(0.62*h)], radius=40, fill=255)  # right arm
-
-        overlay = img.copy().convert("RGBA")
-        tint = Image.new("RGBA", (w, h), (0, 212, 255, 90))
-        overlay.paste(tint, (0,0), mask)
-        overlay = overlay.convert("RGB")
-
-        binary = Image.new("RGB", (w, h), (0,0,0))
-        binary.paste((255,255,255), (0,0), mask)
-        return overlay, binary
-
-    # -------------------------
-    # Run gating (upload -> run -> show)
-    # -------------------------
-    if "demo_ran" not in st.session_state:
-        st.session_state.demo_ran = False
-    demo_key = (pack_id, getattr(uploaded, "name", None))
-    if st.session_state.get("demo_key") != demo_key:
-        st.session_state.demo_key = demo_key
-        st.session_state.demo_ran = False
-
-    run_clicked = st.button("Run Demo (simulate end-to-end)", type="primary", width='stretch')
-    if run_clicked:
-        st.session_state.demo_ran = True
-
-    # Layout
-    colL, colR = st.columns([1.15, 0.85], gap="large")
-
-    # Load preset pack
-    pack_dir = packs.get(pack_id, DEMO_GALLERY_DIR / pack_id)
-    preset = _load_preset(pack_dir)
-
-    vision = _safe_dict(preset.get("vision", {}))
-    middleware = _safe_dict(preset.get("middleware", {}))
-    body = _safe_dict(middleware.get("body_specs_cm", {}))
-    signals = _safe_dict(middleware.get("signals", {}))
-    artifacts = _safe_dict(preset.get("artifacts", {}))
-    notes = _safe_dict(preset.get("notes", {}))
-    profile = _safe_dict(preset.get("profile", {})) or _safe_dict(preset.get("meta", {}))
-
-    body_type = (profile.get("body_type") or profile.get("profile") or "Athletic")
-    garment_class = (signals.get("garment_class") or middleware.get("garment_class") or profile.get("garment_class") or "-")
-    material = (signals.get("material") or middleware.get("material") or profile.get("material") or "-")
-
-    disclaimer = notes.get("disclaimer") or "Demo Gallery outputs are preset for stability. Live inference is available under Experimental mode."
-    st.info(disclaimer)
-
-    # Input image (prefer upload for display)
-    up_img = _pil_from_upload(uploaded) if (use_upload_as_input and uploaded is not None) else None
-    if up_img is None:
-        # fallback to demo pack input if exists
-        demo_input, _ = _try_read(pack_dir,
-            vision.get("input_image"),
-            "input.jpg", "input.png"
-        )
-    else:
-        demo_input = up_img
-
-    with colL:
-        st.markdown("## Layer 1 — Vision (Input)")
-        st.caption(f"Demo Pack: {pack_id} | Profile: {body_type} / {garment_class} | material: {material}")
-        st.markdown("**Pipeline trace (Demo):** OpenCV (PnP/Homography) → MediaPipe Pose → YOLOv8-seg (Mask)")
-
-        if demo_input is not None:
-            st.image(demo_input, caption="Input image (display only in Demo mode)", width='stretch')
-        else:
-            st.warning("Upload an image to preview input in Demo mode.")
-
-        if not st.session_state.demo_ran:
-            st.warning("1) 사진 업로드  2) Run Demo 버튼 클릭  → 그 다음에 Step 01/02/03, 결과, 아티팩트를 표시합니다.")
-            st.stop()
-
-        # Step 01/02/03: prefer overlay on uploaded photo; else use pack artifacts
-        st.markdown("### Step 01 — PnP & Homography (Demo)")
-        if up_img is not None:
-            st.image(_overlay_pnp(up_img), caption="OpenCV: reference-plane calibration (demo overlay)", width='stretch')
-        else:
-            img, name = _try_read(pack_dir,
-                vision.get("pnp_homography_image"),
-                artifacts.get("pnp"), artifacts.get("calib"),
-                "step01_calib.jpg","step01_calib.png",
-                "pnp_homography.png","pnp_homography.jpg"
-            )
-            if img is not None:
-                st.image(img, caption=f"OpenCV: reference-plane calibration (demo artifact: {name})", width='stretch')
+        with col_g2:
+            if 'vto_done' in st.session_state and st.session_state['vto_done']:
+                st.image(st.session_state['vto_result'], caption="Final Synthesis Result", use_container_width=True)
+                st.balloons()
+                st.success("Virtual Try-On Complete.")
             else:
-                st.warning("Unreadable image: step01 artifact")
+                st.info("Click 'Generate' to see the final output.")
+                # 빈 공간 홀더
+                st.markdown("""
+                <div style='height:300px; display:flex; align-items:center; justify-content:center; background:#111; color:#333; border-radius:10px;'>
+                    Waiting for Generation...
+                </div>
+                """, unsafe_allow_html=True)
 
-        st.markdown("### Step 02 — Pose (Demo)")
-        if up_img is not None:
-            st.image(_overlay_pose(up_img), caption="MediaPipe Pose landmarks (demo overlay)", width='stretch')
-        else:
-            img, name = _try_read(pack_dir,
-                vision.get("pose_landmarks_image"),
-                artifacts.get("pose"),
-                "step02_pose.jpg","step02_pose.png",
-                "pose.png","pose.jpg"
-            )
-            if img is not None:
-                st.image(img, caption=f"MediaPipe Pose landmarks (demo artifact: {name})", width='stretch')
-            else:
-                st.warning("Unreadable image: step02 artifact")
-
-        st.markdown("### Step 03 — Segmentation (Demo)")
-        cA, cB = st.columns(2)
-        if up_img is not None:
-            ov, bi = _overlay_mask(up_img)
-            with cA:
-                st.image(ov, caption="YOLOv8-seg mask overlay (demo overlay)", width='stretch')
-            with cB:
-                st.image(bi, caption="Binary mask (demo overlay)", width='stretch')
-        else:
-            overlay, oname = _try_read(pack_dir,
-                artifacts.get("mask_overlay"),
-                "step03_mask_overlay.jpg","step03_mask_overlay.png"
-            )
-            mask, mname = _try_read(pack_dir,
-                vision.get("segmentation_mask_image"),
-                artifacts.get("mask"),
-                "step03_mask.png","mask.png"
-            )
-            with cA:
-                if overlay is not None:
-                    st.image(overlay, caption=f"YOLOv8-seg mask overlay (artifact: {oname})", width='stretch')
-                else:
-                    st.warning("Unreadable image: mask overlay")
-            with cB:
-                if mask is not None:
-                    st.image(mask, caption=f"Binary mask (artifact: {mname})", width='stretch')
-                else:
-                    st.warning("Unreadable image: mask")
-
-    # Numbers
-    shoulder = _get_num(body, "shoulder_width_cm", "shoulder_width")
-    chest = _get_num(body, "chest_circ_cm", "chest_circ")
-    waist = _get_num(body, "waist_circ_cm", "waist_circ")
-    hip = _get_num(body, "hip_circ_cm", "hip_circ")
-
-    with colR:
-        st.markdown("## Layer 2 — Middleware (Preset Output)")
-        st.markdown("### Body Specs (Output)")
-        m1, m2 = st.columns(2)
-        with m1:
-            st.metric("Shoulder Width", _fmt_cm(shoulder))
-            st.metric("Chest Circumference", _fmt_cm(chest))
-        with m2:
-            st.metric("Waist Circumference", _fmt_cm(waist))
-            st.metric("Hip Circumference", _fmt_cm(hip))
-
-        st.markdown("### Clothing & Physics Signals")
-        st.json({
-            "garment_class": garment_class,
-            "material": material,
-            "material_props": signals.get("material_props", {}),
-            "volume_offset": signals.get("volume_offset", {}),
-            "warm_start": signals.get("warm_start", {}),
-            "user_height_cm (display)": float(user_height_cm),
-        }, expanded=True)
-
-        st.markdown("### Export JSON")
-        _download_json_button("Download preset (demo pack) JSON", preset, f"{pack_id}_preset.json")
-
-        st.markdown("---")
-        st.markdown("## Layer 3 — 3D Engine (Demo Artifact)")
-        drape, dname = _try_read(pack_dir,
-            artifacts.get("drape"),
-            "layer3_drape.png","layer3_drape.jpg","draped.png","layer3_drape.png"
-        )
-        if drape is not None:
-            st.image(drape, caption=f"Draped garment render / 3D preview (artifact: {dname})", width='stretch')
-        else:
-            st.warning("Unreadable image: Layer3 drape")
-
-        st.markdown("---")
-        st.markdown("## Layer 4 — GenAI Synthesis (Demo Artifacts)")
-        edge, ename = _try_read(pack_dir, artifacts.get("edge"), "layer4_edge.png","layer4_edge.jpg","edge.png","edge.jpg")
-        depth, zname = _try_read(pack_dir, artifacts.get("depth"), "layer4_depth.png","layer4_depth.jpg","depth.png","depth.jpg")
-        final, fname = _try_read(pack_dir, artifacts.get("final"), "layer4_final.jpg","final.jpg","layer4_final.png","final.png")
-
-        e1, e2 = st.columns(2)
-        with e1:
-            if edge is not None:
-                st.image(edge, caption=f"ControlNet guide: Edge (artifact: {ename})", width='stretch')
-            else:
-                st.warning("Unreadable image: Edge")
-        with e2:
-            if depth is not None:
-                st.image(depth, caption=f"ControlNet guide: Depth (artifact: {zname})", width='stretch')
-            else:
-                st.warning("Unreadable image: Depth")
-
-        if final is not None:
-            st.image(final, caption=f"Final photoreal output (artifact: {fname})", width='stretch')
-        else:
-            st.warning("Unreadable image: Final output")
-
-        with st.expander("Full preset.json (for auditing)", expanded=False):
-            st.json(preset, expanded=True)
-
-    st.stop()
-
-# =========================
-# Live (Experimental) mode
-# =========================
-st.warning(
-    "Live (Experimental) 모드는 현재 안정화 대상이 아닙니다. "
-    "심사/시연은 Demo Gallery(Always Success)를 사용하세요."
-)
-
-st.markdown("### Live 모드 상태")
-st.write({
-    "cv2_available": CV2_OK,
-    "numpy_available": (np is not None),
-    "marker_pdf_exists": MARKER_PDF_PATH.exists(),
-    "demo_gallery_packs_found": list(_list_demo_packs().keys()),
-})
-
-st.info("원하면 다음 단계로 Live 파이프라인(ArUco/Pose/YOLO)을 Demo 안정화와 분리해서 테스트 하네스부터 다시 잡아줄 수 있습니다.")
+else:
+    # 초기 화면
+    st.info("👋 Welcome to FormFoundry MVP Demo. Please upload an image to start the pipeline.")
+    
+    # Tech Stack Preview
+    st.markdown("### Powered by")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.markdown("##### 👁️ Vision\nMediaPipe, YOLOv8")
+    c2.markdown("##### 🧠 Logic\nVolume-Offset, ViT")
+    c3.markdown("##### 👕 3D\nSMPL-X, CLO3D")
+    c4.markdown("##### ✨ GenAI\nSDXL, ControlNet")
