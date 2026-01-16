@@ -505,32 +505,85 @@ def _get_pose_model():
 
 
 def infer_pose_landmarks(img_bgr: np.ndarray, calib: Optional[A4Calib]) -> Optional[PoseLandmarks]:
+    """
+    MediaPipe Pose is optional in MVP.
+    Robustness fix:
+      - run Pose on FULL image (not A4-warp)
+      - ensure uint8 + contiguous
+      - try multiple downscales (hi-res photos often fail with landmarks=None)
+    Returns landmarks in ORIGINAL image coordinates.
+    """
+    _require_cv2()
     if mp is None:
         return None
     model = _get_pose_model()
     if model is None:
         return None
 
+    img_rgb0 = _to_rgb(img_bgr)
+    if img_rgb0 is None:
+        return None
+    if img_rgb0.dtype != np.uint8:
+        img_rgb0 = img_rgb0.astype(np.uint8)
+    img_rgb0 = np.ascontiguousarray(img_rgb0)
 
-    img_rgb = _to_rgb(img_bgr)
-    h, w = img_rgb.shape[:2]
-    res = model.process(img_rgb)
-    if not res.pose_landmarks:
+    h0, w0 = img_rgb0.shape[:2]
+    if h0 < 2 or w0 < 2:
         return None
 
-    xy, z = {}, {}
-    for idx, lm in enumerate(res.pose_landmarks.landmark):
-        xy[idx] = (float(lm.x * w), float(lm.y * h))
-        z[idx] = float(lm.z)
+    # smaller-first tends to be more stable for BlazePose on server/CPU
+    max_side_list = []
+    for ms in (1024, 1280, 1600, max(h0, w0)):
+        if ms not in max_side_list:
+            max_side_list.append(ms)
 
-    if calib is not None and calib.ok:
-        pts = np.array(list(xy.values()), dtype=np.float32)
-        pts2 = _apply_homography_pts(pts, calib.H_img2px)
-        xy = {k: (float(pts2[i, 0]), float(pts2[i, 1])) for i, k in enumerate(list(xy.keys()))}
+    for max_side in max_side_list:
+        scale = 1.0
+        if max(h0, w0) > max_side:
+            scale = float(max_side) / float(max(h0, w0))
 
-    return PoseLandmarks(xy=xy, z=z)
+        if scale < 1.0:
+            new_w = int(round(w0 * scale))
+            new_h = int(round(h0 * scale))
+            if new_w < 2 or new_h < 2:
+                continue
+            img_rgb = cv2.resize(img_rgb0, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            img_rgb = img_rgb0
 
+        try:
+            img_rgb.flags.writeable = False
+            res = model.process(img_rgb)
+        except Exception:
+            continue
+        finally:
+            try:
+                img_rgb.flags.writeable = True
+            except Exception:
+                pass
 
+        if res is None or getattr(res, "pose_landmarks", None) is None:
+            continue
+
+        lms = res.pose_landmarks.landmark
+        if not lms:
+            continue
+
+        h, w = img_rgb.shape[:2]
+        sx = float(w0) / float(w)
+        sy = float(h0) / float(h)
+
+        xy = {}
+        z = {}
+        for i, lm in enumerate(lms):
+            x = float(lm.x) * float(w) * sx
+            y = float(lm.y) * float(h) * sy
+            xy[i] = (x, y)
+            z[i] = float(lm.z)
+
+        return PoseLandmarks(xy=xy, z=z)
+
+    return None
 def estimate_rotation_deg(pose: PoseLandmarks) -> float:
     if 11 not in pose.xy or 12 not in pose.xy:
         return 0.0
