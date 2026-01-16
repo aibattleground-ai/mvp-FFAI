@@ -1029,8 +1029,23 @@ with colL:
 # --- Resolve input image (defines img_bgr) ---
 _require_cv2()
 
+def _read_image_path(path):
+    """Read an image from filesystem applying EXIF orientation (important for iPhone photos)."""
+    _require_cv2()
+    try:
+        from PIL import Image, ImageOps
+        import numpy as np
+        img = Image.open(str(path))
+        img = ImageOps.exif_transpose(img)
+        img = img.convert("RGB")
+        arr = np.array(img)
+        return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    except Exception:
+        # last-resort fallback
+        return cv2.imread(str(path), cv2.IMREAD_COLOR)
+
 if use_demo:
-    img_bgr = cv2.imread(str(demo_path), cv2.IMREAD_COLOR)
+    img_bgr = _read_image_path(demo_path)
     if img_bgr is None:
         st.error("demo image read failed")
         st.stop()
