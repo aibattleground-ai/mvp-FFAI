@@ -1,0 +1,38 @@
+{
+  "demo_id": "demo_02",
+  "title": "Demo Pack: demo_02 | Profile: Regular / hoodie",
+  "profile": "Regular",
+  "user_height_cm_display": 175,
+  "garment_class": "hoodie",
+  "material": "knit",
+  "material_props": {
+    "thickness_mm": 4.8,
+    "stiffness_bucket": "soft",
+    "density_bucket": "medium"
+  },
+  "volume_offset": {
+    "offset_per_side_cm": 0.75
+  },
+  "warm_start": {
+    "stability": 0.88,
+    "iter_reduction_pct": 31
+  },
+  "body_specs_cm": {
+    "shoulder_width_cm": 45.0,
+    "chest_circ_cm": 98.0,
+    "waist_circ_cm": 80.0,
+    "hip_circ_cm": 96.0
+  },
+  "artifacts": {
+    "input": "input.jpg",
+    "step01_calib": "step01_calib.jpg",
+    "step02_pose": "step02_pose.jpg",
+    "step03_mask": "step03_mask.png",
+    "step03_mask_overlay": "step03_mask_overlay.jpg",
+    "layer3_drape": "layer3_drape.png",
+    "layer4_edge": "layer4_edge.png",
+    "layer4_depth": "layer4_depth.png",
+    "layer4_final": "layer4_final.jpg"
+  },
+  "notes": "Demo Gallery outputs are preset for stability. Live inference is available under Experimental mode."
+}

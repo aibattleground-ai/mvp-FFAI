@@ -1,0 +1,38 @@
+{
+  "demo_id": "demo_03",
+  "title": "Demo Pack: demo_03 | Profile: Slim / coat",
+  "profile": "Slim",
+  "user_height_cm_display": 180,
+  "garment_class": "coat",
+  "material": "wool",
+  "material_props": {
+    "thickness_mm": 6.5,
+    "stiffness_bucket": "firm",
+    "density_bucket": "high"
+  },
+  "volume_offset": {
+    "offset_per_side_cm": 0.95
+  },
+  "warm_start": {
+    "stability": 0.9,
+    "iter_reduction_pct": 35
+  },
+  "body_specs_cm": {
+    "shoulder_width_cm": 44.0,
+    "chest_circ_cm": 94.0,
+    "waist_circ_cm": 76.0,
+    "hip_circ_cm": 92.0
+  },
+  "artifacts": {
+    "input": "input.jpg",
+    "step01_calib": "step01_calib.jpg",
+    "step02_pose": "step02_pose.jpg",
+    "step03_mask": "step03_mask.png",
+    "step03_mask_overlay": "step03_mask_overlay.jpg",
+    "layer3_drape": "layer3_drape.png",
+    "layer4_edge": "layer4_edge.png",
+    "layer4_depth": "layer4_depth.png",
+    "layer4_final": "layer4_final.jpg"
+  },
+  "notes": "Demo Gallery outputs are preset for stability. Live inference is available under Experimental mode."
+}

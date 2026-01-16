@@ -294,7 +294,7 @@ if mode.startswith("Demo"):
     def _safe_dict(x):
         return x if isinstance(x, dict) else {}
 
-    def _resolve_demo_path(x, pack_dir: Path) -> Path | None:
+    def _resolve_demo_path(x, pack_dir: Path) -> Optional[Path]:
         if not x:
             return None
         try:

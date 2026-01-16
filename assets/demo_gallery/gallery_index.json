@@ -1,0 +1,20 @@
+{
+  "version": "1.0",
+  "demos": [
+    {
+      "demo_id": "demo_01",
+      "title": "Athletic / short_sleeve",
+      "profile": "Athletic"
+    },
+    {
+      "demo_id": "demo_02",
+      "title": "Regular / hoodie",
+      "profile": "Regular"
+    },
+    {
+      "demo_id": "demo_03",
+      "title": "Slim / coat",
+      "profile": "Slim"
+    }
+  ]
+}
